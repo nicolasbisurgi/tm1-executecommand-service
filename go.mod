@@ -1,4 +1,4 @@
-module github.com/Hubert-Heijkers/executecommandservice
+module github.com/Hubert-Heijkers/tm1-executecommand-service
 
 go 1.19
 
