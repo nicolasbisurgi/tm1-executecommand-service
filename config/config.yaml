@@ -1,0 +1,35 @@
+server:
+  http_port: 9090
+  command_timeout_seconds: 15
+
+logging:
+  enabled: true
+  file: "logs/tm1executecommandservice.log"
+  level: "info"
+  max_size: 10
+  max_backups: 3
+  max_age: 28
+
+security:
+  command_whitelist:
+    enabled: true
+    allowed_commands:
+      - "^powershell.*\\.ps1.*$"      # Allow any .ps1 script with parameters
+      - "^python.*\\.py.*$"           # Allow any .py script with parameters
+      - "^cmd /C .*\\.bat.*$"         # Allow any .bat file with parameters
+      - "^cmd /C echo.*$"             # Allow echo commands
+  ip_whitelist:
+      enabled: true
+      allowed_ips:
+        - "127.0.0.1"          # IPv4 localhost
+        - "::1"                # IPv6 localhost
+        - "192.168.1.0/24"     # Local network range
+        - "10.0.0.0/8"         # Private network range
+        - "73.9.87.97"         # my macbook
+        - "3.224.15.70"        # ibm v12 instance
+        # - "73.58.128.59"       # Ben's pc
+  https:
+    enabled: false
+    port: 9443  # Default HTTPS port
+    cert_file: "cert/server.crt"
+    key_file: "cert/server.key"

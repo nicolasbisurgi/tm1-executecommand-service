@@ -58,6 +58,35 @@ Either of these requests will start `/bin/bash /path/to/script.sh arg1 arg2` and
 
 > Note that while TM1's `ExecuteCommand` function didn't return anything, if the requester is willing to wait for the command to complete, the output is returned in the response body, ready to be consumed if needed.
 
+### Configuration
+
+The service is configured using a `config.yaml` file, which includes the following sections:
+
+- **Server Configuration**:
+  - `http_port`: The port on which the server listens for HTTP requests. Default is 8080.
+  - `command_timeout_seconds`: The maximum time allowed for a command to execute before timing out. Default is 300 seconds.
+
+- **Logging Configuration**:
+  - `enabled`: Indicates whether logging is enabled.
+  - `file`: The path to the log file.
+  - `level`: The logging level (e.g., info, debug).
+  - `max_size`: The maximum size of the log file before it is rotated.
+  - `max_backups`: The maximum number of backup log files to keep.
+  - `max_age`: The maximum age (in days) to retain old log files.
+
+- **Security Configuration**:
+  - **Command Whitelist**:
+    - `enabled`: Indicates whether the command whitelist is enabled.
+    - `allowed_commands`: A list of regex patterns for allowed commands, such as `.ps1`, `.py`, and `.bat` scripts, as well as echo commands.
+  - **IP Whitelist**:
+    - `enabled`: Indicates whether the IP whitelist is enabled.
+    - `allowed_ips`: A list of allowed IP addresses and ranges, including localhost, local network ranges, and specific IPs.
+  - **HTTPS Configuration**:
+    - `enabled`: Indicates whether HTTPS is enabled.
+    - `port`: The port on which the server listens for HTTPS requests. Default is 9443.
+    - `cert_file`: The path to the SSL certificate file.
+    - `key_file`: The path to the SSL key file.
+
 ### How to use
 
 Run the Go application directly from source, optionally specifying a port using the --port flag, as in:
