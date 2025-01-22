@@ -25,9 +25,7 @@ security:
         - "::1"                # IPv6 localhost
         - "192.168.1.0/24"     # Local network range
         - "10.0.0.0/8"         # Private network range
-        - "73.9.87.97"         # my macbook
         - "3.224.15.70"        # ibm v12 instance
-        # - "73.58.128.59"       # Ben's pc
   https:
     enabled: false
     port: 9443  # Default HTTPS port
