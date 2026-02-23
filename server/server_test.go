@@ -7,8 +7,6 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
-	"os/exec"
-	"path/filepath"
 	"sync"
 	"testing"
 	"time"
@@ -17,26 +15,10 @@ import (
 	"github.com/Hubert-Heijkers/tm1-executecommand-service/logger"
 )
 
-func createTestCerts(t *testing.T) (certFile, keyFile string) {
-	tmpDir := t.TempDir()
-	certFile = filepath.Join(tmpDir, "test.crt")
-	keyFile = filepath.Join(tmpDir, "test.key")
-
-	// Generate test certificate and key
-	cmd := fmt.Sprintf("openssl req -x509 -newkey rsa:4096 -keyout %s -out %s -days 1 -nodes -subj '/CN=localhost'", 
-		keyFile, certFile)
-	if err := exec.Command("sh", "-c", cmd).Run(); err != nil {
-		t.Fatalf("Failed to generate test certificates: %v", err)
-	}
-
-	return certFile, keyFile
-}
-
 func setupTestServer(t *testing.T) (*Server, func()) {
-	// Create test configuration
 	cfg := &config.Config{
 		Server: config.ServerConfig{
-			HTTPPort:             8080,
+			HTTPPort:              8080,
 			CommandTimeoutSeconds: 30,
 		},
 		Security: config.SecurityConfig{
@@ -46,10 +28,18 @@ func setupTestServer(t *testing.T) (*Server, func()) {
 			IPWhitelist: config.IPWhitelistConfig{
 				Enabled: false,
 			},
+			CommandPolicy: config.CommandPolicyConfig{
+				Enabled: false,
+			},
+			Authentication: config.AuthConfig{
+				Enabled: false,
+			},
+			RateLimit: config.RateLimitConfig{
+				Enabled: false,
+			},
 		},
 	}
 
-	// Create test logger
 	log, err := logger.InitLogger(cfg)
 	if err != nil {
 		t.Fatalf("Failed to initialize logger: %v", err)
@@ -70,16 +60,13 @@ func TestServerBasicHTTP(t *testing.T) {
 	srv, cleanup := setupTestServer(t)
 	defer cleanup()
 
-	// Add test handler
 	srv.RegisterHandler("/test", func(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprint(w, "test response")
 	})
 
-	// Start server in test mode
 	testServer := httptest.NewServer(srv.createServeMux())
 	defer testServer.Close()
 
-	// Test HTTP request
 	resp, err := http.Get(testServer.URL + "/test")
 	if err != nil {
 		t.Fatalf("Failed to make HTTP request: %v", err)
@@ -97,56 +84,66 @@ func TestServerBasicHTTP(t *testing.T) {
 }
 
 func TestSecurityHeaders(t *testing.T) {
-	_, cleanup := setupTestServer(t)
-	defer cleanup()
-
-	// Create test handler with security headers
-	handler := func(w http.ResponseWriter, r *http.Request) {
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprint(w, "test response")
-	}
-	secureHandler := SecurityHeaders(handler)
+	})
 
-	// Create test request
-	req := httptest.NewRequest("GET", "/test", nil)
-	rec := httptest.NewRecorder()
+	t.Run("With HTTPS enabled", func(t *testing.T) {
+		secureHandler := SecurityHeaders(true, handler)
 
-	// Execute handler
-	secureHandler.ServeHTTP(rec, req)
+		req := httptest.NewRequest("GET", "/test", nil)
+		rec := httptest.NewRecorder()
+		secureHandler.ServeHTTP(rec, req)
 
-	// Check security headers
-	expectedHeaders := map[string]string{
-		"Strict-Transport-Security": "max-age=31536000; includeSubDomains",
-		"X-Content-Type-Options":    "nosniff",
-		"X-Frame-Options":           "DENY",
-		"Content-Security-Policy":   "default-src 'self'",
-	}
-
-	for header, expected := range expectedHeaders {
-		if got := rec.Header().Get(header); got != expected {
-			t.Errorf("Header %q = %q, want %q", header, got, expected)
+		expectedHeaders := map[string]string{
+			"Strict-Transport-Security": "max-age=31536000; includeSubDomains",
+			"X-Content-Type-Options":    "nosniff",
+			"X-Frame-Options":           "DENY",
+			"Content-Security-Policy":   "default-src 'self'",
+			"Referrer-Policy":           "strict-origin-when-cross-origin",
 		}
-	}
+
+		for header, expected := range expectedHeaders {
+			if got := rec.Header().Get(header); got != expected {
+				t.Errorf("Header %q = %q, want %q", header, got, expected)
+			}
+		}
+	})
+
+	t.Run("Without HTTPS - no HSTS", func(t *testing.T) {
+		secureHandler := SecurityHeaders(false, handler)
+
+		req := httptest.NewRequest("GET", "/test", nil)
+		rec := httptest.NewRecorder()
+		secureHandler.ServeHTTP(rec, req)
+
+		// HSTS should NOT be set when HTTPS is disabled
+		if got := rec.Header().Get("Strict-Transport-Security"); got != "" {
+			t.Errorf("HSTS should not be set when HTTPS is disabled, got %q", got)
+		}
+
+		// Other security headers should still be present
+		if got := rec.Header().Get("X-Content-Type-Options"); got != "nosniff" {
+			t.Errorf("X-Content-Type-Options = %q, want %q", got, "nosniff")
+		}
+	})
 }
 
 func TestServerShutdown(t *testing.T) {
 	srv, cleanup := setupTestServer(t)
 	defer cleanup()
 
-	// Start server in test mode
 	testServer := httptest.NewServer(srv.createServeMux())
 
-	// Test graceful shutdown
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	// Close test server
 	testServer.Close()
 
 	if err := srv.Shutdown(ctx); err != nil {
 		t.Errorf("Server shutdown failed: %v", err)
 	}
 
-	// Verify server is no longer accepting connections
 	_, err := http.Get(testServer.URL + "/test")
 	if err == nil {
 		t.Error("Expected error after shutdown, got none")
@@ -157,17 +154,14 @@ func TestServerConcurrency(t *testing.T) {
 	srv, cleanup := setupTestServer(t)
 	defer cleanup()
 
-	// Add test handler that simulates work
 	srv.RegisterHandler("/test", func(w http.ResponseWriter, r *http.Request) {
 		time.Sleep(100 * time.Millisecond)
 		fmt.Fprint(w, "test response")
 	})
 
-	// Start server in test mode
 	testServer := httptest.NewServer(srv.createServeMux())
 	defer testServer.Close()
 
-	// Make concurrent requests
 	const concurrentRequests = 10
 	var wg sync.WaitGroup
 	errors := make(chan error, concurrentRequests)
@@ -213,13 +207,12 @@ func TestServerConcurrency(t *testing.T) {
 const maxRequestSize = 1024 * 1024 // 1MB max request size
 
 func TestServerRequestSizeLimit(t *testing.T) {
-	// Create a test handler that enforces size limit
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.ContentLength > maxRequestSize {
 			http.Error(w, "Request too large", http.StatusBadRequest)
 			return
 		}
-		
+
 		r.Body = http.MaxBytesReader(w, r.Body, maxRequestSize)
 		_, err := io.ReadAll(r.Body)
 		if err != nil {
@@ -230,16 +223,14 @@ func TestServerRequestSizeLimit(t *testing.T) {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
-		
+
 		fmt.Fprintf(w, "received request")
 	})
 
-	// Start test server
 	testServer := httptest.NewServer(handler)
 	defer testServer.Close()
 
-	// Test with large request body
-	largeBody := make([]byte, maxRequestSize+1) // Exceed max size by 1 byte
+	largeBody := make([]byte, maxRequestSize+1)
 	resp, err := http.Post(testServer.URL, "application/octet-stream", bytes.NewReader(largeBody))
 	if err != nil {
 		t.Fatalf("Failed to make request: %v", err)
@@ -250,7 +241,6 @@ func TestServerRequestSizeLimit(t *testing.T) {
 		t.Errorf("Expected status %d for large request, got %d", http.StatusBadRequest, resp.StatusCode)
 	}
 
-	// Test with acceptable request body
 	smallBody := make([]byte, maxRequestSize/2)
 	resp, err = http.Post(testServer.URL, "application/octet-stream", bytes.NewReader(smallBody))
 	if err != nil {

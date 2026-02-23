@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -25,13 +26,17 @@ import (
 	"golang.org/x/sys/windows/svc/eventlog"
 )
 
-var (
-	cfg       *config.Config
-	ipChecker *ip.IPChecker
-	elog      debug.Log
-)
+// elog is the Windows event log — kept as package-level since it's only used at startup.
+var elog debug.Log
 
 const maxRequestSize = 1024 * 1024 // 1MB max request size
+
+// App holds the application dependencies, replacing package-level globals.
+type App struct {
+	cfg       *config.Config
+	ipChecker *ip.IPChecker
+	logger    *logger.CommandLogger
+}
 
 type executeCommandRequest struct {
 	CommandLine string `json:"CommandLine"`
@@ -48,12 +53,12 @@ func (rw *responseWriter) WriteHeader(code int) {
 	rw.ResponseWriter.WriteHeader(code)
 }
 
-func executeCommand(commandLine string, wait int64, r *http.Request, requestID string, threadID uint64) (string, error) {
-	log := logger.GetLogger()
+func (app *App) executeCommand(commandLine string, wait int64, r *http.Request, requestID string, threadID uint64) (string, error) {
+	lg := app.logger
 	startTime := time.Now()
 
 	// Log command start
-	log.LogCommandStart(commandLine, logger.Fields{
+	lg.LogCommandStart(commandLine, logger.Fields{
 		"wait":       wait,
 		"source_ip":  r.RemoteAddr,
 		"request_id": requestID,
@@ -63,17 +68,23 @@ func executeCommand(commandLine string, wait int64, r *http.Request, requestID s
 		"path":       r.URL.Path,
 	})
 
-	if cfg != nil && !cfg.IsCommandAllowed(commandLine) {
-		log.LogCommandError(fmt.Errorf("command not allowed by whitelist: %s", commandLine), logger.Fields{
-			"command":     commandLine,
-			"source_ip":   r.RemoteAddr,
-			"request_id":  requestID,
-			"thread_id":   threadID,
-			"duration_ms": time.Since(startTime).Milliseconds(),
-		})
-		return "", fmt.Errorf("command not allowed by whitelist: %s", commandLine)
+	// Check command policy
+	if app.cfg != nil {
+		allowed, reason := app.cfg.IsCommandPermitted(commandLine)
+		if !allowed {
+			lg.LogCommandError(fmt.Errorf("command not permitted: %s", reason), logger.Fields{
+				"command":     commandLine,
+				"source_ip":   r.RemoteAddr,
+				"request_id":  requestID,
+				"thread_id":   threadID,
+				"duration_ms": time.Since(startTime).Milliseconds(),
+				"reason":      reason,
+			})
+			return "", fmt.Errorf("command not permitted")
+		}
 	}
 
+	// Parse the command
 	var cmd *exec.Cmd
 
 	if strings.HasPrefix(strings.ToLower(commandLine), "cmd /c ") {
@@ -89,33 +100,32 @@ func executeCommand(commandLine string, wait int64, r *http.Request, requestID s
 	}
 
 	if cmd == nil {
-		log.LogCommandError(fmt.Errorf("invalid command format: %s", commandLine), logger.Fields{
+		lg.LogCommandError(fmt.Errorf("invalid command format: %s", commandLine), logger.Fields{
 			"command":     commandLine,
 			"source_ip":   r.RemoteAddr,
 			"request_id":  requestID,
 			"thread_id":   threadID,
 			"duration_ms": time.Since(startTime).Milliseconds(),
 		})
-		return "", fmt.Errorf("invalid command format: %s", commandLine)
+		return "", fmt.Errorf("invalid command format")
 	}
-
-	// Create context with timeout
-	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(cfg.Server.CommandTimeoutSeconds)*time.Second)
-	defer cancel()
-
-	// Set the command's context
-	cmd = exec.CommandContext(ctx, cmd.Path, cmd.Args[1:]...)
 
 	var output string
 
 	if wait == 1 {
+		// For wait commands, use context with timeout
+		ctx, cancel := context.WithTimeout(context.Background(), time.Duration(app.cfg.Server.CommandTimeoutSeconds)*time.Second)
+		defer cancel()
+
+		cmd = exec.CommandContext(ctx, cmd.Path, cmd.Args[1:]...)
+
 		outputBytes, err := cmd.CombinedOutput()
 		output = string(outputBytes)
 		if err != nil {
 			if ctx.Err() == context.DeadlineExceeded {
-				err = fmt.Errorf("command execution timed out after %d seconds", cfg.Server.CommandTimeoutSeconds)
+				err = fmt.Errorf("command execution timed out after %d seconds", app.cfg.Server.CommandTimeoutSeconds)
 			}
-			log.LogCommandError(err, logger.Fields{
+			lg.LogCommandError(err, logger.Fields{
 				"command":     commandLine,
 				"output":      output,
 				"source_ip":   r.RemoteAddr,
@@ -127,8 +137,10 @@ func executeCommand(commandLine string, wait int64, r *http.Request, requestID s
 			return output, err
 		}
 	} else {
+		// For fire-and-forget (wait==0): do NOT use context so the process survives
+		// after the HTTP handler returns
 		if err := cmd.Start(); err != nil {
-			log.LogCommandError(err, logger.Fields{
+			lg.LogCommandError(err, logger.Fields{
 				"command":     commandLine,
 				"source_ip":   r.RemoteAddr,
 				"request_id":  requestID,
@@ -142,7 +154,7 @@ func executeCommand(commandLine string, wait int64, r *http.Request, requestID s
 	}
 
 	// Log command completion
-	log.LogCommandComplete(commandLine, output, time.Since(startTime), logger.Fields{
+	lg.LogCommandComplete(commandLine, output, time.Since(startTime), logger.Fields{
 		"wait":       wait,
 		"source_ip":  r.RemoteAddr,
 		"request_id": requestID,
@@ -154,22 +166,41 @@ func executeCommand(commandLine string, wait int64, r *http.Request, requestID s
 	return output, nil
 }
 
-func isIPAllowed(r *http.Request) bool {
-	if cfg == nil || !cfg.Security.IPWhitelist.Enabled {
+// getClientIP extracts the real client IP, respecting trust_proxy configuration.
+// Only reads X-Forwarded-For when the request comes from a trusted proxy.
+func (app *App) getClientIP(r *http.Request) string {
+	if app.cfg != nil && app.cfg.Security.IPWhitelist.TrustProxy {
+		host, _, err := net.SplitHostPort(r.RemoteAddr)
+		if err != nil {
+			host = r.RemoteAddr
+		}
+		for _, proxy := range app.cfg.Security.IPWhitelist.TrustedProxies {
+			if host == proxy {
+				xff := r.Header.Get("X-Forwarded-For")
+				if xff != "" {
+					// Take the leftmost (original client) IP
+					parts := strings.Split(xff, ",")
+					return strings.TrimSpace(parts[0])
+				}
+				break
+			}
+		}
+	}
+	return r.RemoteAddr
+}
+
+func (app *App) isIPAllowed(r *http.Request) bool {
+	if app.cfg == nil || !app.cfg.Security.IPWhitelist.Enabled {
 		return true
 	}
 
-	clientIP := r.Header.Get("X-Forwarded-For")
-	if clientIP == "" {
-		clientIP = r.RemoteAddr
-	}
-
-	return ipChecker.IsAllowed(clientIP)
+	clientIP := app.getClientIP(r)
+	return app.ipChecker.IsAllowed(clientIP)
 }
 
-func commandHandler(w http.ResponseWriter, r *http.Request) {
+func (app *App) commandHandler(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
-	log := logger.GetLogger()
+	lg := app.logger
 
 	rw := &responseWriter{
 		ResponseWriter: w,
@@ -181,7 +212,7 @@ func commandHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	allowed := isIPAllowed(r)
+	allowed := app.isIPAllowed(r)
 
 	var commandLine string
 	var wait int64 = -1
@@ -230,10 +261,10 @@ func commandHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Log HTTP request received with command and IP status
-	requestID, threadID := log.LogHTTPRequestReceived(r, commandLine, allowed)
+	requestID, threadID := lg.LogHTTPRequestReceived(r, commandLine, allowed)
 
 	if !allowed {
-		http.Error(rw, "Access denied: IP not in whitelist", http.StatusForbidden)
+		http.Error(rw, "Access denied", http.StatusForbidden)
 		return
 	}
 
@@ -253,24 +284,37 @@ func commandHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	output, err := executeCommand(commandLine, wait, r, requestID, threadID)
+	output, err := app.executeCommand(commandLine, wait, r, requestID, threadID)
 	if err != nil {
-		http.Error(rw, fmt.Sprintf("Error executing command: %v", err), http.StatusInternalServerError)
+		// Use generic error messages to avoid leaking internal details
+		if strings.Contains(err.Error(), "not permitted") {
+			http.Error(rw, "Command not permitted", http.StatusForbidden)
+		} else {
+			http.Error(rw, "Command execution failed", http.StatusInternalServerError)
+		}
 		return
 	}
 
 	rw.Write([]byte(output))
 
 	// Log HTTP request processed
-	log.LogHTTPRequestProcessed(r, rw.statusCode, time.Since(start), requestID, threadID)
+	lg.LogHTTPRequestProcessed(r, rw.statusCode, time.Since(start), requestID, threadID)
 }
 
-type executeCommandService struct{}
+func healthHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte(`{"status":"ok"}`))
+}
+
+type executeCommandService struct {
+	app *App
+}
 
 func (m *executeCommandService) Execute(args []string, r <-chan svc.ChangeRequest, changes chan<- svc.Status) (svcSpecificEC bool, exitCode uint32) {
 	const cmdsAccepted = svc.AcceptStop | svc.AcceptShutdown
 	changes <- svc.Status{State: svc.StartPending}
-	go runServer()
+	go m.app.runServer()
 	changes <- svc.Status{State: svc.Running, Accepts: cmdsAccepted}
 
 loop:
@@ -288,10 +332,10 @@ loop:
 	return
 }
 
-func runWindowsService(name string) {
+func runWindowsService(name string, app *App) {
 	run := svc.Run
-	elog.Info(1, fmt.Sprintf("starting %s service on port %d", name, cfg.Server.HTTPPort))
-	err := run(name, &executeCommandService{})
+	elog.Info(1, fmt.Sprintf("starting %s service on port %d", name, app.cfg.Server.HTTPPort))
+	err := run(name, &executeCommandService{app: app})
 	if err != nil {
 		elog.Error(1, fmt.Sprintf("service %s failed: %v", name, err))
 		return
@@ -299,18 +343,16 @@ func runWindowsService(name string) {
 	elog.Info(1, fmt.Sprintf("service %s stopped", name))
 }
 
-func runServer() {
-	srv := server.NewServer(cfg, logger.GetLogger())
-	srv.RegisterHandler("/ExecuteCommand", commandHandler)
+func (app *App) runServer() {
+	srv := server.NewServer(app.cfg, app.logger)
+	srv.RegisterHandler("/ExecuteCommand", app.commandHandler)
+	srv.RegisterHandler("/health", healthHandler)
 
-	httpsPort := strconv.Itoa(cfg.Server.HTTPPort)
-	httpPort := ""
+	httpPort := strconv.Itoa(app.cfg.Server.HTTPPort)
+	httpsPort := ""
 
-	if cfg != nil && cfg.Security.HTTPS.Enabled {
-		httpPort = strconv.Itoa(cfg.Server.HTTPPort)
-		httpsPort = strconv.Itoa(cfg.Security.HTTPS.Port)
-	} else {
-		httpPort = strconv.Itoa(cfg.Server.HTTPPort)
+	if app.cfg.Security.HTTPS.Enabled {
+		httpsPort = strconv.Itoa(app.cfg.Security.HTTPS.Port)
 	}
 
 	if err := srv.Start(httpPort, httpsPort); err != nil {
@@ -338,8 +380,7 @@ func main() {
 		log.Fatal("Configuration file is required. Use --config flag to specify the path.")
 	}
 
-	var err error
-	cfg, err = config.LoadConfig(*configFile)
+	cfg, err := config.LoadConfig(*configFile)
 	if err != nil {
 		log.Fatalf("Failed to load configuration: %v", err)
 	}
@@ -349,6 +390,7 @@ func main() {
 		log.Fatalf("Failed to initialize logger: %v", err)
 	}
 
+	var ipChecker *ip.IPChecker
 	if cfg.Security.IPWhitelist.Enabled {
 		ipChecker, err = ip.NewIPChecker(cfg.Security.IPWhitelist.AllowedIPs)
 		if err != nil {
@@ -357,6 +399,12 @@ func main() {
 		lg.Info("IP whitelist enabled with " +
 			strconv.Itoa(len(cfg.Security.IPWhitelist.AllowedIPs)) +
 			" entries")
+	}
+
+	app := &App{
+		cfg:       cfg,
+		ipChecker: ipChecker,
+		logger:    lg,
 	}
 
 	lg.Info("Service starting with configuration from: " + *configFile)
@@ -372,10 +420,10 @@ func main() {
 			return
 		}
 		defer elog.Close()
-		runWindowsService("ExecuteCommandService")
+		runWindowsService("ExecuteCommandService", app)
 	} else {
 		fmt.Printf("Starting ExecuteCommand service on port %d...\n", cfg.Server.HTTPPort)
 		elog = debug.New("ExecuteCommandService")
-		runServer()
+		app.runServer()
 	}
 }

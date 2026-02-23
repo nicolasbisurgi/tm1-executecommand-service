@@ -15,8 +15,8 @@ import (
 	"github.com/Hubert-Heijkers/tm1-executecommand-service/logger"
 )
 
-func setupTestConfig() *config.Config {
-	return &config.Config{
+func setupTestApp(t *testing.T) *App {
+	cfg := &config.Config{
 		Server: config.ServerConfig{
 			HTTPPort:              8080,
 			CommandTimeoutSeconds: 30,
@@ -26,27 +26,37 @@ func setupTestConfig() *config.Config {
 				Enabled:    true,
 				AllowedIPs: []string{"127.0.0.1"},
 			},
+			CommandPolicy: config.CommandPolicyConfig{
+				Enabled: false,
+			},
+			Authentication: config.AuthConfig{
+				Enabled: false,
+			},
+			RateLimit: config.RateLimitConfig{
+				Enabled: false,
+			},
 		},
 	}
-}
 
-func setupTestEnvironment(t *testing.T) {
-	cfg = setupTestConfig()
-	var err error
-	_, err = logger.InitLogger(cfg)
+	lg, err := logger.InitLogger(cfg)
 	if err != nil {
 		t.Fatalf("Failed to initialize logger: %v", err)
 	}
 
-	// Initialize IP checker
-	ipChecker, err = ip.NewIPChecker(cfg.Security.IPWhitelist.AllowedIPs)
+	ipChecker, err := ip.NewIPChecker(cfg.Security.IPWhitelist.AllowedIPs)
 	if err != nil {
 		t.Fatalf("Failed to initialize IP checker: %v", err)
+	}
+
+	return &App{
+		cfg:       cfg,
+		ipChecker: ipChecker,
+		logger:    lg,
 	}
 }
 
 func TestBasicCommandExecution(t *testing.T) {
-	setupTestEnvironment(t)
+	app := setupTestApp(t)
 
 	tests := []struct {
 		name          string
@@ -114,7 +124,7 @@ func TestBasicCommandExecution(t *testing.T) {
 			req.RemoteAddr = "127.0.0.1:12345"
 
 			rr := httptest.NewRecorder()
-			handler := http.HandlerFunc(commandHandler)
+			handler := http.HandlerFunc(app.commandHandler)
 			handler.ServeHTTP(rr, req)
 
 			if rr.Code != tt.expectedCode {
@@ -132,7 +142,7 @@ func TestBasicCommandExecution(t *testing.T) {
 }
 
 func TestConcurrentCommandExecution(t *testing.T) {
-	setupTestEnvironment(t)
+	app := setupTestApp(t)
 
 	const numRequests = 10
 	var wg sync.WaitGroup
@@ -150,7 +160,7 @@ func TestConcurrentCommandExecution(t *testing.T) {
 			req := httptest.NewRequest("GET", "/ExecuteCommand?"+params.Encode(), nil)
 			req.RemoteAddr = "127.0.0.1:12345"
 			rr := httptest.NewRecorder()
-			handler := http.HandlerFunc(commandHandler)
+			handler := http.HandlerFunc(app.commandHandler)
 			handler.ServeHTTP(rr, req)
 
 			if rr.Code != http.StatusOK {
@@ -180,8 +190,8 @@ func TestConcurrentCommandExecution(t *testing.T) {
 }
 
 func TestLongRunningCommand(t *testing.T) {
-	setupTestEnvironment(t)
-	cfg.Server.CommandTimeoutSeconds = 2
+	app := setupTestApp(t)
+	app.cfg.Server.CommandTimeoutSeconds = 2
 
 	tests := []struct {
 		name          string
@@ -220,7 +230,7 @@ func TestLongRunningCommand(t *testing.T) {
 			req := httptest.NewRequest("GET", "/ExecuteCommand?"+params.Encode(), nil)
 			req.RemoteAddr = "127.0.0.1:12345"
 			rr := httptest.NewRecorder()
-			handler := http.HandlerFunc(commandHandler)
+			handler := http.HandlerFunc(app.commandHandler)
 
 			handler.ServeHTTP(rr, req)
 
@@ -229,15 +239,16 @@ func TestLongRunningCommand(t *testing.T) {
 					rr.Code, tt.expectedCode, rr.Body.String())
 			}
 
-			if tt.shouldTimeout && !strings.Contains(rr.Body.String(), "command execution timed out") {
-				t.Errorf("expected timeout error, got: %s", rr.Body.String())
+			// With generic errors, timeout returns "Command execution failed"
+			if tt.shouldTimeout && !strings.Contains(rr.Body.String(), "Command execution failed") {
+				t.Errorf("expected generic error message, got: %s", rr.Body.String())
 			}
 		})
 	}
 }
 
 func TestCommandOutputEncoding(t *testing.T) {
-	setupTestEnvironment(t)
+	app := setupTestApp(t)
 
 	tests := []struct {
 		name     string
@@ -271,7 +282,7 @@ func TestCommandOutputEncoding(t *testing.T) {
 			req := httptest.NewRequest("GET", "/ExecuteCommand?"+params.Encode(), nil)
 			req.RemoteAddr = "127.0.0.1:12345"
 			rr := httptest.NewRecorder()
-			handler := http.HandlerFunc(commandHandler)
+			handler := http.HandlerFunc(app.commandHandler)
 			handler.ServeHTTP(rr, req)
 
 			if rr.Code != http.StatusOK {
@@ -287,7 +298,7 @@ func TestCommandOutputEncoding(t *testing.T) {
 }
 
 func TestRequestValidation(t *testing.T) {
-	setupTestEnvironment(t)
+	app := setupTestApp(t)
 
 	tests := []struct {
 		name         string
@@ -351,7 +362,7 @@ func TestRequestValidation(t *testing.T) {
 
 			req.RemoteAddr = "127.0.0.1:12345"
 			rr := httptest.NewRecorder()
-			handler := http.HandlerFunc(commandHandler)
+			handler := http.HandlerFunc(app.commandHandler)
 			handler.ServeHTTP(rr, req)
 
 			if rr.Code != tt.expectedCode {
@@ -359,5 +370,149 @@ func TestRequestValidation(t *testing.T) {
 					rr.Code, tt.expectedCode, rr.Body.String())
 			}
 		})
+	}
+}
+
+func TestIPWhitelistWithTrustProxy(t *testing.T) {
+	tests := []struct {
+		name         string
+		trustProxy   bool
+		proxies      []string
+		remoteAddr   string
+		xff          string
+		allowedIPs   []string
+		expectedCode int
+	}{
+		{
+			name:         "Trust proxy disabled - ignores X-Forwarded-For",
+			trustProxy:   false,
+			remoteAddr:   "127.0.0.1:12345",
+			xff:          "10.0.0.99",
+			allowedIPs:   []string{"127.0.0.1"},
+			expectedCode: http.StatusOK,
+		},
+		{
+			name:         "Trust proxy enabled - uses X-Forwarded-For from trusted proxy",
+			trustProxy:   true,
+			proxies:      []string{"192.168.1.1"},
+			remoteAddr:   "192.168.1.1:12345",
+			xff:          "10.0.0.5",
+			allowedIPs:   []string{"10.0.0.5", "192.168.1.1"},
+			expectedCode: http.StatusOK,
+		},
+		{
+			name:         "Trust proxy enabled - rejects spoofed XFF from non-trusted proxy",
+			trustProxy:   true,
+			proxies:      []string{"192.168.1.1"},
+			remoteAddr:   "10.0.0.99:12345",
+			xff:          "127.0.0.1",
+			allowedIPs:   []string{"127.0.0.1"},
+			expectedCode: http.StatusForbidden,
+		},
+		{
+			name:         "Trust proxy enabled - XFF client not in whitelist",
+			trustProxy:   true,
+			proxies:      []string{"192.168.1.1"},
+			remoteAddr:   "192.168.1.1:12345",
+			xff:          "10.99.99.99",
+			allowedIPs:   []string{"192.168.1.1"},
+			expectedCode: http.StatusForbidden,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := &config.Config{
+				Server: config.ServerConfig{
+					HTTPPort:              8080,
+					CommandTimeoutSeconds: 30,
+				},
+				Security: config.SecurityConfig{
+					IPWhitelist: config.IPWhitelistConfig{
+						Enabled:        true,
+						AllowedIPs:     tt.allowedIPs,
+						TrustProxy:     tt.trustProxy,
+						TrustedProxies: tt.proxies,
+					},
+					CommandPolicy: config.CommandPolicyConfig{
+						Enabled: false,
+					},
+				},
+			}
+
+			lg, _ := logger.InitLogger(cfg)
+			ipChecker, _ := ip.NewIPChecker(cfg.Security.IPWhitelist.AllowedIPs)
+
+			app := &App{cfg: cfg, ipChecker: ipChecker, logger: lg}
+
+			params := url.Values{}
+			params.Add("CommandLine", "cmd /C echo test")
+			params.Add("Wait", "1")
+
+			req := httptest.NewRequest("GET", "/ExecuteCommand?"+params.Encode(), nil)
+			req.RemoteAddr = tt.remoteAddr
+			if tt.xff != "" {
+				req.Header.Set("X-Forwarded-For", tt.xff)
+			}
+
+			rr := httptest.NewRecorder()
+			handler := http.HandlerFunc(app.commandHandler)
+			handler.ServeHTTP(rr, req)
+
+			if rr.Code != tt.expectedCode {
+				t.Errorf("expected status %d, got %d, body: %q",
+					tt.expectedCode, rr.Code, rr.Body.String())
+			}
+		})
+	}
+}
+
+func TestHealthEndpoint(t *testing.T) {
+	req := httptest.NewRequest("GET", "/health", nil)
+	rr := httptest.NewRecorder()
+
+	healthHandler(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Errorf("expected 200, got %d", rr.Code)
+	}
+
+	expected := `{"status":"ok"}`
+	if rr.Body.String() != expected {
+		t.Errorf("expected %q, got %q", expected, rr.Body.String())
+	}
+
+	if ct := rr.Header().Get("Content-Type"); ct != "application/json" {
+		t.Errorf("expected Content-Type application/json, got %q", ct)
+	}
+}
+
+func TestGenericErrorMessages(t *testing.T) {
+	app := setupTestApp(t)
+
+	// Test that internal errors don't leak details
+	params := url.Values{}
+	params.Add("CommandLine", "nonexistentcommand_xyz")
+	params.Add("Wait", "1")
+
+	req := httptest.NewRequest("GET", "/ExecuteCommand?"+params.Encode(), nil)
+	req.RemoteAddr = "127.0.0.1:12345"
+
+	rr := httptest.NewRecorder()
+	handler := http.HandlerFunc(app.commandHandler)
+	handler.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusInternalServerError {
+		t.Errorf("expected 500, got %d", rr.Code)
+	}
+
+	body := rr.Body.String()
+	if !strings.Contains(body, "Command execution failed") {
+		t.Errorf("expected generic error message, got: %q", body)
+	}
+
+	// Ensure the actual command name is NOT in the response
+	if strings.Contains(body, "nonexistentcommand_xyz") {
+		t.Error("error response should not contain internal command details")
 	}
 }

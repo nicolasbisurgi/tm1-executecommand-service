@@ -43,7 +43,6 @@ func (s *Server) setupTLSConfig() *tls.Config {
 			tls.CurveP256,
 			tls.X25519,
 		},
-		PreferServerCipherSuites: true,
 		CipherSuites: []uint16{
 			tls.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
 			tls.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
@@ -52,21 +51,33 @@ func (s *Server) setupTLSConfig() *tls.Config {
 			tls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
 			tls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
 		},
-		// Session tickets and caching enabled for faster subsequent TLS handshakes
 		SessionTicketsDisabled: false,
-		ClientSessionCache:     tls.NewLRUClientSessionCache(128),
 	}
 }
 
 func (s *Server) createServeMux() http.Handler {
 	mux := http.NewServeMux()
-
 	for path, handler := range s.handlers {
-		wrappedHandler := SecurityHeaders(handler)
-		mux.Handle(path, wrappedHandler)
+		mux.HandleFunc(path, handler)
 	}
 
-	return mux
+	// Build middleware chain (innermost -> outermost)
+	var h http.Handler = mux
+
+	// Security headers (innermost — closest to handlers)
+	h = SecurityHeaders(s.config.Security.HTTPS.Enabled, h)
+
+	// API key authentication
+	if s.config.Security.Authentication.Enabled {
+		h = APIKeyAuth(s.config.Security.Authentication.APIKey, h)
+	}
+
+	// Rate limiting (outermost — cheapest check first)
+	if s.config.Security.RateLimit.Enabled {
+		h = RateLimit(s.config.Security.RateLimit.RequestsPerMinute, h)
+	}
+
+	return h
 }
 
 func maybeRedirectToHTTPS(cfg *config.Config, httpsPort string, baseHandler http.Handler) http.Handler {
@@ -74,18 +85,6 @@ func maybeRedirectToHTTPS(cfg *config.Config, httpsPort string, baseHandler http
 		return HTTPSRedirect(httpsPort)(baseHandler)
 	}
 	return baseHandler
-}
-
-func (s *Server) waitForPort(port string) error {
-	for i := 0; i < 10; i++ {
-		conn, err := net.Dial("tcp", "127.0.0.1:"+port)
-		if err == nil {
-			conn.Close()
-			return nil
-		}
-		time.Sleep(100 * time.Millisecond)
-	}
-	return fmt.Errorf("port %s not ready after waiting", port)
 }
 
 func (s *Server) Start(httpPort, httpsPort string) error {
@@ -117,13 +116,9 @@ func (s *Server) Start(httpPort, httpsPort string) error {
 				return
 			}
 
-			if err := s.waitForPort(httpPort); err == nil {
-				readyChan <- struct{}{}
-				s.logger.Info(fmt.Sprintf("HTTP server listening on port %s", httpPort))
-			} else {
-				errChan <- err
-				return
-			}
+			// Listener created successfully — signal readiness
+			readyChan <- struct{}{}
+			s.logger.Info(fmt.Sprintf("HTTP server listening on port %s", httpPort))
 
 			if err := s.httpServer.Serve(listener); err != http.ErrServerClosed {
 				errChan <- fmt.Errorf("HTTP server error: %v", err)
@@ -162,13 +157,9 @@ func (s *Server) Start(httpPort, httpsPort string) error {
 				return
 			}
 
-			if err := s.waitForPort(httpsPort); err == nil {
-				readyChan <- struct{}{}
-				s.logger.Info(fmt.Sprintf("HTTPS server listening on port %s", httpsPort))
-			} else {
-				errChan <- err
-				return
-			}
+			// Listener created successfully — signal readiness
+			readyChan <- struct{}{}
+			s.logger.Info(fmt.Sprintf("HTTPS server listening on port %s", httpsPort))
 
 			if err := s.httpsServer.Serve(listener); err != http.ErrServerClosed {
 				if !strings.Contains(err.Error(), "EOF") {
@@ -196,18 +187,16 @@ func (s *Server) Start(httpPort, httpsPort string) error {
 		}
 	}
 
-	// At this point, servers are ready. Start self-warm goroutine.
+	// Self-warm goroutine for health checks
 	go func() {
 		client := &http.Client{
 			Timeout: 5 * time.Second,
 		}
 
 		var healthURL string
-		// If HTTP is available, use it for health checks to avoid TLS overhead.
 		if !s.config.Security.HTTPS.Enabled || httpPort != "" {
 			healthURL = "http://127.0.0.1:" + httpPort + "/health"
 		} else {
-			// If only HTTPS is available, use HTTPS. If testing with self-signed certs, consider InsecureSkipVerify.
 			transport := &http.Transport{
 				TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
 			}

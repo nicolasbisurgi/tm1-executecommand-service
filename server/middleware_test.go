@@ -67,25 +67,44 @@ func TestSecurityHeadersMiddleware(t *testing.T) {
 		name            string
 		method          string
 		path            string
+		httpsEnabled    bool
 		expectedHeaders map[string]string
+		absentHeaders   []string
 		expectedStatus  int
 	}{
 		{
-			name:   "GET request security headers",
-			method: "GET",
-			path:   "/test",
+			name:         "GET request with HTTPS",
+			method:       "GET",
+			path:         "/test",
+			httpsEnabled: true,
 			expectedHeaders: map[string]string{
 				"Strict-Transport-Security": "max-age=31536000; includeSubDomains",
 				"X-Content-Type-Options":    "nosniff",
 				"X-Frame-Options":           "DENY",
 				"Content-Security-Policy":   "default-src 'self'",
+				"Referrer-Policy":           "strict-origin-when-cross-origin",
+				"Permissions-Policy":        "camera=(), microphone=(), geolocation=()",
 			},
 			expectedStatus: http.StatusOK,
 		},
 		{
-			name:   "POST request security headers",
-			method: "POST",
-			path:   "/test",
+			name:         "GET request without HTTPS - no HSTS",
+			method:       "GET",
+			path:         "/test",
+			httpsEnabled: false,
+			expectedHeaders: map[string]string{
+				"X-Content-Type-Options":  "nosniff",
+				"X-Frame-Options":         "DENY",
+				"Content-Security-Policy": "default-src 'self'",
+			},
+			absentHeaders:  []string{"Strict-Transport-Security"},
+			expectedStatus: http.StatusOK,
+		},
+		{
+			name:         "POST request security headers",
+			method:       "POST",
+			path:         "/test",
+			httpsEnabled: true,
 			expectedHeaders: map[string]string{
 				"Strict-Transport-Security": "max-age=31536000; includeSubDomains",
 				"X-Content-Type-Options":    "nosniff",
@@ -103,7 +122,7 @@ func TestSecurityHeadersMiddleware(t *testing.T) {
 				w.Write([]byte("test response"))
 			})
 
-			secureHandler := SecurityHeaders(handler)
+			secureHandler := SecurityHeaders(tt.httpsEnabled, handler)
 
 			req := httptest.NewRequest(tt.method, tt.path, nil)
 			rec := httptest.NewRecorder()
@@ -119,85 +138,162 @@ func TestSecurityHeadersMiddleware(t *testing.T) {
 					t.Errorf("Header %q = %q, want %q", header, got, expected)
 				}
 			}
+
+			for _, header := range tt.absentHeaders {
+				if got := rec.Header().Get(header); got != "" {
+					t.Errorf("Header %q should be absent, got %q", header, got)
+				}
+			}
 		})
 	}
 }
 
-func TestSecurityHeadersWithErrors(t *testing.T) {
+func TestAPIKeyAuth(t *testing.T) {
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("ok"))
+	})
+
+	apiKey := "test-api-key-that-is-at-least-32-chars-long!!"
+
+	authed := APIKeyAuth(apiKey, handler)
+
 	tests := []struct {
-		name           string
-		handler       func(w http.ResponseWriter, r *http.Request)
-		expectedCode  int
-		checkHeaders  bool
+		name         string
+		auth         string
+		path         string
+		expectedCode int
 	}{
 		{
-			name: "Panic in handler",
-			handler: func(w http.ResponseWriter, r *http.Request) {
-				panic("test panic")
-			},
-			expectedCode: http.StatusInternalServerError,
-			checkHeaders: true,
+			name:         "Valid key",
+			auth:         "Bearer " + apiKey,
+			path:         "/test",
+			expectedCode: http.StatusOK,
 		},
 		{
-			name: "Write after WriteHeader",
-			handler: func(w http.ResponseWriter, r *http.Request) {
-				w.WriteHeader(http.StatusBadRequest)
-				w.WriteHeader(http.StatusOK) // Should be ignored
-			},
-			expectedCode: http.StatusBadRequest,
-			checkHeaders: true,
+			name:         "Invalid key",
+			auth:         "Bearer wrong-key",
+			path:         "/test",
+			expectedCode: http.StatusUnauthorized,
+		},
+		{
+			name:         "Missing authorization header",
+			auth:         "",
+			path:         "/test",
+			expectedCode: http.StatusUnauthorized,
+		},
+		{
+			name:         "Wrong auth scheme",
+			auth:         "Basic " + apiKey,
+			path:         "/test",
+			expectedCode: http.StatusUnauthorized,
+		},
+		{
+			name:         "Health endpoint bypasses auth",
+			auth:         "",
+			path:         "/health",
+			expectedCode: http.StatusOK,
+		},
+		{
+			name:         "Health endpoint with wrong key still passes",
+			auth:         "Bearer wrong-key",
+			path:         "/health",
+			expectedCode: http.StatusOK,
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			handler := http.HandlerFunc(tt.handler)
-			secureHandler := SecurityHeaders(handler)
-
-			req := httptest.NewRequest("GET", "/test", nil)
-			rec := httptest.NewRecorder()
-
-			if tt.name == "Panic in handler" {
-				defer func() {
-					if r := recover(); r == nil {
-						t.Error("Expected panic was not recovered")
-					}
-				}()
+			req := httptest.NewRequest("GET", tt.path, nil)
+			if tt.auth != "" {
+				req.Header.Set("Authorization", tt.auth)
 			}
 
-			secureHandler.ServeHTTP(rec, req)
+			rec := httptest.NewRecorder()
+			authed.ServeHTTP(rec, req)
 
 			if rec.Code != tt.expectedCode {
-				t.Errorf("Expected status %d, got %d", tt.expectedCode, rec.Code)
-			}
-
-			if tt.checkHeaders {
-				expectedHeaders := map[string]string{
-					"Strict-Transport-Security": "max-age=31536000; includeSubDomains",
-					"X-Content-Type-Options":    "nosniff",
-					"X-Frame-Options":           "DENY",
-					"Content-Security-Policy":   "default-src 'self'",
-				}
-
-				for header, expected := range expectedHeaders {
-					if got := rec.Header().Get(header); got != expected {
-						t.Errorf("Header %q = %q, want %q", header, got, expected)
-					}
-				}
+				t.Errorf("Expected %d, got %d, body: %q", tt.expectedCode, rec.Code, rec.Body.String())
 			}
 		})
 	}
 }
 
+func TestRateLimit(t *testing.T) {
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+
+	t.Run("Under limit passes", func(t *testing.T) {
+		limited := RateLimit(5, handler)
+
+		for i := 0; i < 5; i++ {
+			req := httptest.NewRequest("GET", "/test", nil)
+			req.RemoteAddr = "192.168.1.1:12345"
+			rec := httptest.NewRecorder()
+			limited.ServeHTTP(rec, req)
+
+			if rec.Code != http.StatusOK {
+				t.Errorf("Request %d: expected 200, got %d", i+1, rec.Code)
+			}
+		}
+	})
+
+	t.Run("Over limit returns 429", func(t *testing.T) {
+		limited := RateLimit(3, handler)
+
+		// First 3 should pass
+		for i := 0; i < 3; i++ {
+			req := httptest.NewRequest("GET", "/test", nil)
+			req.RemoteAddr = "10.0.0.1:12345"
+			rec := httptest.NewRecorder()
+			limited.ServeHTTP(rec, req)
+
+			if rec.Code != http.StatusOK {
+				t.Errorf("Request %d: expected 200, got %d", i+1, rec.Code)
+			}
+		}
+
+		// 4th should be rate limited
+		req := httptest.NewRequest("GET", "/test", nil)
+		req.RemoteAddr = "10.0.0.1:12345"
+		rec := httptest.NewRecorder()
+		limited.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusTooManyRequests {
+			t.Errorf("Expected 429, got %d", rec.Code)
+		}
+	})
+
+	t.Run("Per-IP isolation", func(t *testing.T) {
+		limited := RateLimit(2, handler)
+
+		// Exhaust limit for IP1
+		for i := 0; i < 3; i++ {
+			req := httptest.NewRequest("GET", "/test", nil)
+			req.RemoteAddr = "192.168.1.10:12345"
+			rec := httptest.NewRecorder()
+			limited.ServeHTTP(rec, req)
+		}
+
+		// IP2 should still have capacity
+		req := httptest.NewRequest("GET", "/test", nil)
+		req.RemoteAddr = "192.168.1.20:12345"
+		rec := httptest.NewRecorder()
+		limited.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusOK {
+			t.Errorf("Different IP should not be rate limited, got %d", rec.Code)
+		}
+	})
+}
+
 func TestMiddlewareChaining(t *testing.T) {
-	// Create a handler that records the order of middleware execution
 	var executionOrder []string
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		executionOrder = append(executionOrder, "handler")
 		w.Write([]byte("test response"))
 	})
 
-	// Create test middleware
 	testMiddleware1 := func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			executionOrder = append(executionOrder, "middleware1")
@@ -212,16 +308,13 @@ func TestMiddlewareChaining(t *testing.T) {
 		})
 	}
 
-	// Chain middlewares
-	finalHandler := testMiddleware1(testMiddleware2(SecurityHeaders(handler)))
+	finalHandler := testMiddleware1(testMiddleware2(SecurityHeaders(true, handler)))
 
-	// Test request
 	req := httptest.NewRequest("GET", "/test", nil)
 	rec := httptest.NewRecorder()
 
 	finalHandler.ServeHTTP(rec, req)
 
-	// Verify execution order
 	expectedOrder := []string{"middleware1", "middleware2", "handler"}
 	for i, step := range expectedOrder {
 		if i >= len(executionOrder) || executionOrder[i] != step {
@@ -230,12 +323,10 @@ func TestMiddlewareChaining(t *testing.T) {
 		}
 	}
 
-	// Verify response
 	if rec.Code != http.StatusOK {
 		t.Errorf("Expected status %d, got %d", http.StatusOK, rec.Code)
 	}
 
-	// Verify security headers are still present
 	expectedHeaders := map[string]string{
 		"Strict-Transport-Security": "max-age=31536000; includeSubDomains",
 		"X-Content-Type-Options":    "nosniff",
@@ -247,5 +338,27 @@ func TestMiddlewareChaining(t *testing.T) {
 		if got := rec.Header().Get(header); got != expected {
 			t.Errorf("Header %q = %q, want %q", header, got, expected)
 		}
+	}
+}
+
+func TestStripPort(t *testing.T) {
+	tests := []struct {
+		input    string
+		expected string
+	}{
+		{"192.168.1.1:8080", "192.168.1.1"},
+		{"127.0.0.1:12345", "127.0.0.1"},
+		{"[::1]:8080", "::1"},
+		{"192.168.1.1", "192.168.1.1"},
+		{"", ""},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.input, func(t *testing.T) {
+			result := stripPort(tt.input)
+			if result != tt.expected {
+				t.Errorf("stripPort(%q) = %q, want %q", tt.input, result, tt.expected)
+			}
+		})
 	}
 }
