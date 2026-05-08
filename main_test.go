@@ -9,12 +9,16 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
+	"github.com/Hubert-Heijkers/tm1-executecommand-service/command"
 	"github.com/Hubert-Heijkers/tm1-executecommand-service/config"
 	"github.com/Hubert-Heijkers/tm1-executecommand-service/ip"
 	"github.com/Hubert-Heijkers/tm1-executecommand-service/logger"
 )
 
+// setupTestApp wires an App with fake executors so handler tests run anywhere.
+// Tests override app.sync / app.async to inject specific behaviors.
 func setupTestApp(t *testing.T) *App {
 	cfg := &config.Config{
 		Server: config.ServerConfig{
@@ -26,15 +30,9 @@ func setupTestApp(t *testing.T) *App {
 				Enabled:    true,
 				AllowedIPs: []string{"127.0.0.1"},
 			},
-			CommandPolicy: config.CommandPolicyConfig{
-				Enabled: false,
-			},
-			Authentication: config.AuthConfig{
-				Enabled: false,
-			},
-			RateLimit: config.RateLimitConfig{
-				Enabled: false,
-			},
+			CommandPolicy:  config.CommandPolicyConfig{Enabled: false},
+			Authentication: config.AuthConfig{Enabled: false},
+			RateLimit:      config.RateLimitConfig{Enabled: false},
 		},
 	}
 
@@ -52,75 +50,135 @@ func setupTestApp(t *testing.T) *App {
 		cfg:       cfg,
 		ipChecker: ipChecker,
 		logger:    lg,
+		sync:      defaultSyncFake(),
+		async:     defaultAsyncFake(),
+	}
+}
+
+func defaultSyncFake() *command.FakeSync {
+	return &command.FakeSync{
+		OnRun: func(cmd command.Command) (command.Result, error) {
+			return command.Result{Stdout: "default-output\r\n"}, nil
+		},
+	}
+}
+
+func defaultAsyncFake() *command.FakeAsync {
+	return &command.FakeAsync{
+		OnStart: func(cmd command.Command) (command.Handle, error) {
+			return command.Handle{ID: "test-id", PID: 1234, StartedAt: time.Now()}, nil
+		},
+	}
+}
+
+// echoSync returns a SyncExecutor that pretends to be `cmd /C echo X Y Z`:
+// stdout = the args joined by space, CRLF-terminated. Used by tests that
+// want to verify the executor's output reaches the response body unchanged.
+//
+// Note: ParseCommand strips the `cmd /C` wrapper, so for `cmd /C echo test`
+// the parsed Command is {Wrapper: ShellCmdC, Executable: "echo", Args: ["test"]}.
+func echoSync() *command.FakeSync {
+	return &command.FakeSync{
+		OnRun: func(cmd command.Command) (command.Result, error) {
+			var out string
+			if cmd.Wrapper == command.ShellCmdC && strings.EqualFold(cmd.Executable, "echo") {
+				out = strings.Join(cmd.Args, " ")
+			} else {
+				out = cmd.Executable
+			}
+			return command.Result{Stdout: out + "\r\n"}, nil
+		},
 	}
 }
 
 func TestBasicCommandExecution(t *testing.T) {
-	app := setupTestApp(t)
-
 	tests := []struct {
-		name          string
-		method        string
-		commandLine   string
-		wait          int64
-		expectedCode  int
-		expectedError bool
-		checkOutput   func(string) bool
+		name         string
+		method       string
+		commandLine  string
+		wait         int64
+		sync         command.SyncExecutor
+		async        command.AsyncExecutor
+		expectedCode int
+		expectedBody string
 	}{
 		{
-			name:         "Simple echo command",
+			name:         "Sync success writes body verbatim",
 			method:       "GET",
 			commandLine:  "cmd /C echo test",
 			wait:         1,
+			sync:         echoSync(),
 			expectedCode: http.StatusOK,
-			checkOutput: func(output string) bool {
-				return output == "test\r\n"
-			},
+			expectedBody: "test\r\n",
 		},
 		{
-			name:          "Invalid command",
-			method:        "GET",
-			commandLine:   "nonexistentcommand",
-			wait:          1,
-			expectedCode:  http.StatusInternalServerError,
-			expectedError: true,
+			name:         "Spawn failure returns generic 500",
+			method:       "GET",
+			commandLine:  "nonexistentcommand",
+			wait:         1,
+			sync:         &command.FakeSync{OnRun: func(c command.Command) (command.Result, error) { return command.Result{}, &command.ErrSpawnFailed{} }},
+			expectedCode: http.StatusInternalServerError,
+			expectedBody: "Command execution failed\n",
 		},
 		{
-			name:          "Empty command",
-			method:        "GET",
-			commandLine:   "",
-			wait:          1,
-			expectedCode:  http.StatusBadRequest,
-			expectedError: true,
+			name:         "Empty command rejected before executor",
+			method:       "GET",
+			commandLine:  "",
+			wait:         1,
+			expectedCode: http.StatusBadRequest,
 		},
 		{
-			name:         "Command with spaces",
+			name:         "POST with spaces in command",
 			method:       "POST",
 			commandLine:  "cmd /C echo hello world",
 			wait:         1,
+			sync:         echoSync(),
 			expectedCode: http.StatusOK,
-			checkOutput: func(output string) bool {
-				return output == "hello world\r\n"
-			},
+			expectedBody: "hello world\r\n",
+		},
+		{
+			name:         "Async returns started message",
+			method:       "GET",
+			commandLine:  "cmd /C echo bg",
+			wait:         0,
+			expectedCode: http.StatusOK,
+			expectedBody: "Command started successfully",
+		},
+		{
+			name:         "Non-zero exit returns 200 with body",
+			method:       "GET",
+			commandLine:  "cmd /C exit 7",
+			wait:         1,
+			sync: &command.FakeSync{OnRun: func(c command.Command) (command.Result, error) {
+				return command.Result{Stdout: "partial output\r\n", ExitCode: 7}, &command.ErrNonZeroExit{Code: 7}
+			}},
+			expectedCode: http.StatusOK,
+			expectedBody: "partial output\r\n",
+		},
+		{
+			name:         "Timeout returns generic 500",
+			method:       "GET",
+			commandLine:  "cmd /C waitforever",
+			wait:         1,
+			sync: &command.FakeSync{OnRun: func(c command.Command) (command.Result, error) {
+				return command.Result{}, &command.ErrTimeout{Duration: 30 * time.Second}
+			}},
+			expectedCode: http.StatusInternalServerError,
+			expectedBody: "Command execution failed\n",
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			var req *http.Request
-
-			if tt.method == "GET" {
-				params := url.Values{}
-				params.Add("CommandLine", tt.commandLine)
-				params.Add("Wait", fmt.Sprintf("%d", tt.wait))
-				req = httptest.NewRequest("GET", "/ExecuteCommand?"+params.Encode(), nil)
-			} else {
-				// For POST requests, create proper JSON body
-				jsonStr := fmt.Sprintf(`{"CommandLine":"%s","Wait":%d}`, strings.ReplaceAll(tt.commandLine, `"`, `\"`), tt.wait)
-				req = httptest.NewRequest("POST", "/ExecuteCommand", bytes.NewBufferString(jsonStr))
-				req.Header.Set("Content-Type", "application/json")
+			app := setupTestApp(t)
+			if tt.sync != nil {
+				app.sync = tt.sync
+			}
+			if tt.async != nil {
+				app.async = tt.async
 			}
 
+			req := newCommandRequest(t, tt.method, tt.commandLine, tt.wait)
 			req.RemoteAddr = "127.0.0.1:12345"
 
 			rr := httptest.NewRecorder()
@@ -128,14 +186,10 @@ func TestBasicCommandExecution(t *testing.T) {
 			handler.ServeHTTP(rr, req)
 
 			if rr.Code != tt.expectedCode {
-				t.Errorf("handler returned wrong status code: got %v want %v, body: %q",
-					rr.Code, tt.expectedCode, rr.Body.String())
+				t.Fatalf("status: got %d, want %d, body: %q", rr.Code, tt.expectedCode, rr.Body.String())
 			}
-
-			if !tt.expectedError && tt.checkOutput != nil {
-				if !tt.checkOutput(rr.Body.String()) {
-					t.Errorf("unexpected output: %q", rr.Body.String())
-				}
+			if tt.expectedBody != "" && rr.Body.String() != tt.expectedBody {
+				t.Errorf("body: got %q, want %q", rr.Body.String(), tt.expectedBody)
 			}
 		})
 	}
@@ -143,6 +197,7 @@ func TestBasicCommandExecution(t *testing.T) {
 
 func TestConcurrentCommandExecution(t *testing.T) {
 	app := setupTestApp(t)
+	app.sync = echoSync()
 
 	const numRequests = 10
 	var wg sync.WaitGroup
@@ -153,28 +208,22 @@ func TestConcurrentCommandExecution(t *testing.T) {
 		go func(id int) {
 			defer wg.Done()
 
-			params := url.Values{}
-			params.Add("CommandLine", fmt.Sprintf("cmd /C echo Test %d", id))
-			params.Add("Wait", "1")
-
-			req := httptest.NewRequest("GET", "/ExecuteCommand?"+params.Encode(), nil)
+			cmd := fmt.Sprintf("cmd /C echo Test_%d", id)
+			req := newCommandRequest(t, "GET", cmd, 1)
 			req.RemoteAddr = "127.0.0.1:12345"
+
 			rr := httptest.NewRecorder()
-			handler := http.HandlerFunc(app.commandHandler)
-			handler.ServeHTTP(rr, req)
+			http.HandlerFunc(app.commandHandler).ServeHTTP(rr, req)
 
 			if rr.Code != http.StatusOK {
-				results <- fmt.Errorf("request %d failed with status %d: %s", id, rr.Code, rr.Body.String())
+				results <- fmt.Errorf("request %d failed status %d: %s", id, rr.Code, rr.Body.String())
 				return
 			}
-
-			expected := fmt.Sprintf("Test %d\r\n", id)
+			expected := fmt.Sprintf("Test_%d\r\n", id)
 			if rr.Body.String() != expected {
-				results <- fmt.Errorf("request %d returned unexpected output: got %q, want %q",
-					id, rr.Body.String(), expected)
+				results <- fmt.Errorf("request %d output: got %q want %q", id, rr.Body.String(), expected)
 				return
 			}
-
 			results <- nil
 		}(i)
 	}
@@ -189,117 +238,7 @@ func TestConcurrentCommandExecution(t *testing.T) {
 	}
 }
 
-func TestLongRunningCommand(t *testing.T) {
-	app := setupTestApp(t)
-	app.cfg.Server.CommandTimeoutSeconds = 2
-
-	tests := []struct {
-		name          string
-		commandLine   string
-		wait          int64
-		expectedCode  int
-		shouldTimeout bool
-	}{
-		{
-			name:         "Command within timeout",
-			commandLine:  "cmd /C ping -n 2 127.0.0.1",
-			wait:         1,
-			expectedCode: http.StatusOK,
-		},
-		{
-			name:          "Command exceeds timeout",
-			commandLine:   "cmd /C ping -n 11 127.0.0.1",
-			wait:          1,
-			expectedCode:  http.StatusInternalServerError,
-			shouldTimeout: true,
-		},
-		{
-			name:         "Non-waiting command",
-			commandLine:  "cmd /C ping -n 5 127.0.0.1",
-			wait:         0,
-			expectedCode: http.StatusOK,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			params := url.Values{}
-			params.Add("CommandLine", tt.commandLine)
-			params.Add("Wait", fmt.Sprintf("%d", tt.wait))
-
-			req := httptest.NewRequest("GET", "/ExecuteCommand?"+params.Encode(), nil)
-			req.RemoteAddr = "127.0.0.1:12345"
-			rr := httptest.NewRecorder()
-			handler := http.HandlerFunc(app.commandHandler)
-
-			handler.ServeHTTP(rr, req)
-
-			if rr.Code != tt.expectedCode {
-				t.Errorf("handler returned wrong status code: got %v want %v, body: %q",
-					rr.Code, tt.expectedCode, rr.Body.String())
-			}
-
-			// With generic errors, timeout returns "Command execution failed"
-			if tt.shouldTimeout && !strings.Contains(rr.Body.String(), "Command execution failed") {
-				t.Errorf("expected generic error message, got: %s", rr.Body.String())
-			}
-		})
-	}
-}
-
-func TestCommandOutputEncoding(t *testing.T) {
-	app := setupTestApp(t)
-
-	tests := []struct {
-		name     string
-		command  string
-		expected string
-	}{
-		{
-			name:     "ASCII output",
-			command:  "cmd /C echo Hello",
-			expected: "Hello\r\n",
-		},
-		{
-			name:     "Special characters",
-			// Using double caret to print a literal caret
-			command:  "cmd /C echo @#$^^^&*()",
-			expected: "@#$^&*()\r\n",
-		},
-		{
-			name:     "Multiple lines",
-			command:  "cmd /C (echo Line1&&echo Line2)",
-			expected: "Line1\r\nLine2\r\n",
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			params := url.Values{}
-			params.Add("CommandLine", tt.command)
-			params.Add("Wait", "1")
-
-			req := httptest.NewRequest("GET", "/ExecuteCommand?"+params.Encode(), nil)
-			req.RemoteAddr = "127.0.0.1:12345"
-			rr := httptest.NewRecorder()
-			handler := http.HandlerFunc(app.commandHandler)
-			handler.ServeHTTP(rr, req)
-
-			if rr.Code != http.StatusOK {
-				t.Errorf("handler returned wrong status code: got %v want %v, body: %q",
-					rr.Code, http.StatusOK, rr.Body.String())
-			}
-
-			if rr.Body.String() != tt.expected {
-				t.Errorf("unexpected output: got %q, want %q", rr.Body.String(), tt.expected)
-			}
-		})
-	}
-}
-
 func TestRequestValidation(t *testing.T) {
-	app := setupTestApp(t)
-
 	tests := []struct {
 		name         string
 		method       string
@@ -308,211 +247,140 @@ func TestRequestValidation(t *testing.T) {
 		contentType  string
 		expectedCode int
 	}{
-		{
-			name:         "Invalid method",
-			method:       "PUT",
-			commandLine:  "cmd /C echo test",
-			wait:         1,
-			expectedCode: http.StatusMethodNotAllowed,
-		},
-		{
-			name:         "Missing wait parameter",
-			method:       "GET",
-			commandLine:  "cmd /C echo test",
-			expectedCode: http.StatusBadRequest,
-		},
-		{
-			name:         "Invalid wait value",
-			method:       "GET",
-			commandLine:  "cmd /C echo test",
-			wait:         2,
-			expectedCode: http.StatusBadRequest,
-		},
-		{
-			name:         "Invalid content type",
-			method:       "POST",
-			commandLine:  "cmd /C echo test",
-			wait:         1,
-			contentType:  "text/plain",
-			expectedCode: http.StatusBadRequest,
-		},
+		{"Invalid method", "PUT", "cmd /C echo test", 1, "", http.StatusMethodNotAllowed},
+		{"Missing wait parameter", "GET", "cmd /C echo test", 0 /* not added */, "", http.StatusBadRequest},
+		{"Invalid wait value", "GET", "cmd /C echo test", 2, "", http.StatusBadRequest},
+		{"Invalid content type", "POST", "cmd /C echo test", 1, "text/plain", http.StatusBadRequest},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			var req *http.Request
+			app := setupTestApp(t)
 
+			var req *http.Request
 			if tt.method == "GET" {
 				params := url.Values{}
 				params.Add("CommandLine", tt.commandLine)
-				if tt.wait != 0 {
+				if tt.name != "Missing wait parameter" {
 					params.Add("Wait", fmt.Sprintf("%d", tt.wait))
 				}
 				req = httptest.NewRequest(tt.method, "/ExecuteCommand?"+params.Encode(), nil)
 			} else {
-				// For POST requests, create proper JSON body
-				jsonStr := fmt.Sprintf(`{"CommandLine":"%s","Wait":%d}`, strings.ReplaceAll(tt.commandLine, `"`, `\"`), tt.wait)
-				req = httptest.NewRequest(tt.method, "/ExecuteCommand", bytes.NewBufferString(jsonStr))
+				body := fmt.Sprintf(`{"CommandLine":"%s","Wait":%d}`, tt.commandLine, tt.wait)
+				req = httptest.NewRequest(tt.method, "/ExecuteCommand", bytes.NewBufferString(body))
 				if tt.contentType != "" {
 					req.Header.Set("Content-Type", tt.contentType)
 				} else {
 					req.Header.Set("Content-Type", "application/json")
 				}
 			}
-
 			req.RemoteAddr = "127.0.0.1:12345"
+
 			rr := httptest.NewRecorder()
-			handler := http.HandlerFunc(app.commandHandler)
-			handler.ServeHTTP(rr, req)
+			http.HandlerFunc(app.commandHandler).ServeHTTP(rr, req)
 
 			if rr.Code != tt.expectedCode {
-				t.Errorf("handler returned wrong status code: got %v want %v, body: %q",
-					rr.Code, tt.expectedCode, rr.Body.String())
+				t.Errorf("got %d, want %d, body: %q", rr.Code, tt.expectedCode, rr.Body.String())
 			}
 		})
 	}
 }
 
-func TestIPWhitelistWithTrustProxy(t *testing.T) {
-	tests := []struct {
-		name         string
-		trustProxy   bool
-		proxies      []string
-		remoteAddr   string
-		xff          string
-		allowedIPs   []string
-		expectedCode int
-	}{
-		{
-			name:         "Trust proxy disabled - ignores X-Forwarded-For",
-			trustProxy:   false,
-			remoteAddr:   "127.0.0.1:12345",
-			xff:          "10.0.0.99",
-			allowedIPs:   []string{"127.0.0.1"},
-			expectedCode: http.StatusOK,
-		},
-		{
-			name:         "Trust proxy enabled - uses X-Forwarded-For from trusted proxy",
-			trustProxy:   true,
-			proxies:      []string{"192.168.1.1"},
-			remoteAddr:   "192.168.1.1:12345",
-			xff:          "10.0.0.5",
-			allowedIPs:   []string{"10.0.0.5", "192.168.1.1"},
-			expectedCode: http.StatusOK,
-		},
-		{
-			name:         "Trust proxy enabled - rejects spoofed XFF from non-trusted proxy",
-			trustProxy:   true,
-			proxies:      []string{"192.168.1.1"},
-			remoteAddr:   "10.0.0.99:12345",
-			xff:          "127.0.0.1",
-			allowedIPs:   []string{"127.0.0.1"},
-			expectedCode: http.StatusForbidden,
-		},
-		{
-			name:         "Trust proxy enabled - XFF client not in whitelist",
-			trustProxy:   true,
-			proxies:      []string{"192.168.1.1"},
-			remoteAddr:   "192.168.1.1:12345",
-			xff:          "10.99.99.99",
-			allowedIPs:   []string{"192.168.1.1"},
-			expectedCode: http.StatusForbidden,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			cfg := &config.Config{
-				Server: config.ServerConfig{
-					HTTPPort:              8080,
-					CommandTimeoutSeconds: 30,
-				},
-				Security: config.SecurityConfig{
-					IPWhitelist: config.IPWhitelistConfig{
-						Enabled:        true,
-						AllowedIPs:     tt.allowedIPs,
-						TrustProxy:     tt.trustProxy,
-						TrustedProxies: tt.proxies,
-					},
-					CommandPolicy: config.CommandPolicyConfig{
-						Enabled: false,
-					},
-				},
-			}
-
-			lg, _ := logger.InitLogger(cfg)
-			ipChecker, _ := ip.NewIPChecker(cfg.Security.IPWhitelist.AllowedIPs)
-
-			app := &App{cfg: cfg, ipChecker: ipChecker, logger: lg}
-
-			params := url.Values{}
-			params.Add("CommandLine", "cmd /C echo test")
-			params.Add("Wait", "1")
-
-			req := httptest.NewRequest("GET", "/ExecuteCommand?"+params.Encode(), nil)
-			req.RemoteAddr = tt.remoteAddr
-			if tt.xff != "" {
-				req.Header.Set("X-Forwarded-For", tt.xff)
-			}
-
-			rr := httptest.NewRecorder()
-			handler := http.HandlerFunc(app.commandHandler)
-			handler.ServeHTTP(rr, req)
-
-			if rr.Code != tt.expectedCode {
-				t.Errorf("expected status %d, got %d, body: %q",
-					tt.expectedCode, rr.Code, rr.Body.String())
-			}
-		})
-	}
-}
+// IP whitelist + trust_proxy semantics live in server/middleware_test.go now
+// (see TestIPWhitelist). The handler no longer performs the IP check itself —
+// it runs as a server-level middleware in createServeMux.
 
 func TestHealthEndpoint(t *testing.T) {
 	req := httptest.NewRequest("GET", "/health", nil)
 	rr := httptest.NewRecorder()
-
 	healthHandler(rr, req)
 
 	if rr.Code != http.StatusOK {
 		t.Errorf("expected 200, got %d", rr.Code)
 	}
-
-	expected := `{"status":"ok"}`
-	if rr.Body.String() != expected {
-		t.Errorf("expected %q, got %q", expected, rr.Body.String())
+	if got, want := rr.Body.String(), `{"status":"ok"}`; got != want {
+		t.Errorf("body: got %q, want %q", got, want)
 	}
-
-	if ct := rr.Header().Get("Content-Type"); ct != "application/json" {
-		t.Errorf("expected Content-Type application/json, got %q", ct)
+	if got, want := rr.Header().Get("Content-Type"), "application/json"; got != want {
+		t.Errorf("Content-Type: got %q, want %q", got, want)
 	}
 }
 
 func TestGenericErrorMessages(t *testing.T) {
 	app := setupTestApp(t)
+	app.sync = &command.FakeSync{
+		OnRun: func(c command.Command) (command.Result, error) {
+			return command.Result{}, &command.ErrSpawnFailed{Cause: fmt.Errorf("internal: nonexistentcommand_xyz not found")}
+		},
+	}
 
-	// Test that internal errors don't leak details
-	params := url.Values{}
-	params.Add("CommandLine", "nonexistentcommand_xyz")
-	params.Add("Wait", "1")
-
-	req := httptest.NewRequest("GET", "/ExecuteCommand?"+params.Encode(), nil)
+	req := newCommandRequest(t, "GET", "nonexistentcommand_xyz", 1)
 	req.RemoteAddr = "127.0.0.1:12345"
 
 	rr := httptest.NewRecorder()
-	handler := http.HandlerFunc(app.commandHandler)
-	handler.ServeHTTP(rr, req)
+	http.HandlerFunc(app.commandHandler).ServeHTTP(rr, req)
 
 	if rr.Code != http.StatusInternalServerError {
 		t.Errorf("expected 500, got %d", rr.Code)
 	}
-
 	body := rr.Body.String()
 	if !strings.Contains(body, "Command execution failed") {
-		t.Errorf("expected generic error message, got: %q", body)
+		t.Errorf("expected generic error message, got %q", body)
+	}
+	if strings.Contains(body, "nonexistentcommand_xyz") {
+		t.Error("response leaked internal command details")
+	}
+}
+
+func TestPolicyRejection(t *testing.T) {
+	app := setupTestApp(t)
+	app.cfg.Security.CommandPolicy = config.CommandPolicyConfig{
+		Enabled:           true,
+		AllowedExtensions: []string{".ps1"},
+		AllowedDirectories: []config.AllowedDirectoryEntry{
+			{Path: t.TempDir(), IncludeSubdirs: false},
+		},
 	}
 
-	// Ensure the actual command name is NOT in the response
-	if strings.Contains(body, "nonexistentcommand_xyz") {
-		t.Error("error response should not contain internal command details")
+	// Sync executor must NOT be called when policy rejects.
+	app.sync = &command.FakeSync{
+		OnRun: func(c command.Command) (command.Result, error) {
+			t.Error("executor invoked despite policy rejection")
+			return command.Result{}, nil
+		},
+	}
+
+	req := newCommandRequest(t, "GET", `C:\evil\malware.exe`, 1)
+	req.RemoteAddr = "127.0.0.1:12345"
+
+	rr := httptest.NewRecorder()
+	http.HandlerFunc(app.commandHandler).ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusForbidden {
+		t.Errorf("expected 403, got %d, body %q", rr.Code, rr.Body.String())
+	}
+	if !strings.Contains(rr.Body.String(), "Command not permitted") {
+		t.Errorf("expected generic 'Command not permitted', got %q", rr.Body.String())
+	}
+}
+
+// newCommandRequest builds a GET (with query params) or POST (with JSON body)
+// request to /ExecuteCommand for handler testing.
+func newCommandRequest(t *testing.T, method, commandLine string, wait int64) *http.Request {
+	t.Helper()
+	switch method {
+	case "GET":
+		params := url.Values{}
+		params.Add("CommandLine", commandLine)
+		params.Add("Wait", fmt.Sprintf("%d", wait))
+		return httptest.NewRequest("GET", "/ExecuteCommand?"+params.Encode(), nil)
+	case "POST":
+		body := fmt.Sprintf(`{"CommandLine":"%s","Wait":%d}`, strings.ReplaceAll(commandLine, `"`, `\"`), wait)
+		req := httptest.NewRequest("POST", "/ExecuteCommand", bytes.NewBufferString(body))
+		req.Header.Set("Content-Type", "application/json")
+		return req
+	default:
+		req := httptest.NewRequest(method, "/ExecuteCommand", nil)
+		return req
 	}
 }

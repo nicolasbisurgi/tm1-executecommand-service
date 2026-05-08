@@ -4,7 +4,20 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/Hubert-Heijkers/tm1-executecommand-service/command"
 )
+
+// mustParse is a test helper that fails fast on parser errors so we can
+// keep test tables focused on policy decisions rather than parsing minutiae.
+func mustParse(t *testing.T, raw string) command.Command {
+	t.Helper()
+	cmd, err := command.ParseCommand(raw)
+	if err != nil {
+		t.Fatalf("ParseCommand(%q) failed: %v", raw, err)
+	}
+	return cmd
+}
 
 func TestValidate(t *testing.T) {
 	tests := []struct {
@@ -289,14 +302,16 @@ func TestIsCommandPermitted(t *testing.T) {
 						CommandPolicy: CommandPolicyConfig{Enabled: false},
 					},
 				}
-				allowed, _ := disabledCfg.IsCommandPermitted(tt.command)
+				parsed := mustParse(t, tt.command)
+				allowed, _ := disabledCfg.IsCommandPermitted(parsed)
 				if allowed != tt.allowed {
 					t.Errorf("IsCommandPermitted(%q) = %v, want %v", tt.command, allowed, tt.allowed)
 				}
 				return
 			}
 
-			allowed, reason := cfg.IsCommandPermitted(tt.command)
+			parsed := mustParse(t, tt.command)
+			allowed, reason := cfg.IsCommandPermitted(parsed)
 			if allowed != tt.allowed {
 				t.Errorf("IsCommandPermitted(%q) = %v (reason: %s), want %v", tt.command, allowed, reason, tt.allowed)
 			}
@@ -304,62 +319,55 @@ func TestIsCommandPermitted(t *testing.T) {
 	}
 }
 
-func TestExtractScriptPath(t *testing.T) {
+func TestFindScriptToken(t *testing.T) {
 	extensions := []string{".ps1", ".py", ".bat"}
 
 	tests := []struct {
-		name        string
-		command     string
-		expectedErr bool
-		expected    string
+		name string
+		raw  string
+		want string // empty string = no match
 	}{
 		{
-			name:     "Simple script path",
-			command:  "C:\\Scripts\\test.ps1",
-			expected: "C:\\Scripts\\test.ps1",
+			name: "Simple script path",
+			raw:  `C:\Scripts\test.ps1`,
+			want: `C:\Scripts\test.ps1`,
 		},
 		{
-			name:     "Script with interpreter",
-			command:  "python C:\\Scripts\\test.py arg1",
-			expected: "C:\\Scripts\\test.py",
+			name: "Script with interpreter",
+			raw:  `python C:\Scripts\test.py arg1`,
+			want: `C:\Scripts\test.py`,
 		},
 		{
-			name:     "cmd /C prefix",
-			command:  "cmd /C C:\\Scripts\\test.bat arg1",
-			expected: "C:\\Scripts\\test.bat",
+			name: "cmd /C prefix",
+			raw:  `cmd /C C:\Scripts\test.bat arg1`,
+			want: `C:\Scripts\test.bat`,
 		},
 		{
-			name:     "Quoted path",
-			command:  `"C:\Scripts\test.ps1" arg1`,
-			expected: `C:\Scripts\test.ps1`,
+			name: "Quoted path",
+			raw:  `"C:\Scripts\test.ps1" arg1`,
+			want: `C:\Scripts\test.ps1`,
 		},
 		{
-			name:        "No script file found",
-			command:     "python -m module",
-			expectedErr: true,
+			name: "No script file found",
+			raw:  `python -m module`,
+			want: "",
 		},
 		{
-			name:        "Empty command",
-			command:     "",
-			expectedErr: true,
+			name: "Disallowed extension is not a match",
+			raw:  `C:\Scripts\malware.exe`,
+			want: "",
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			result, err := extractScriptPath(tt.command, extensions)
-			if tt.expectedErr {
-				if err == nil {
-					t.Errorf("expected error, got result: %q", result)
-				}
-				return
-			}
+			cmd, err := command.ParseCommand(tt.raw)
 			if err != nil {
-				t.Errorf("unexpected error: %v", err)
-				return
+				t.Fatalf("ParseCommand(%q) failed: %v", tt.raw, err)
 			}
-			if result != tt.expected {
-				t.Errorf("got %q, want %q", result, tt.expected)
+			got := findScriptToken(cmd, extensions)
+			if got != tt.want {
+				t.Errorf("findScriptToken(%q) = %q, want %q", tt.raw, got, tt.want)
 			}
 		})
 	}

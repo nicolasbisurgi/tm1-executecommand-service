@@ -1,5 +1,5 @@
 server:
-  http_port: 9090
+  http_port: 9092
   command_timeout_seconds: 15
 
 logging:
@@ -13,27 +13,28 @@ logging:
 security:
   authentication:
     enabled: false
-    api_key: ""                        # Must be >= 32 characters when enabled
+    api_key: "" # Must be >= 32 characters when enabled
 
   ip_whitelist:
     enabled: true
     allowed_ips:
-      - "127.0.0.1"                   # IPv4 localhost
-      - "::1"                          # IPv6 localhost
-      - "192.168.1.0/24"              # Local network range
-      - "10.0.0.0/8"                  # Private network range
-      - "3.224.15.70"                  # IBM PA US-East egress IP
-    trust_proxy: false                 # Enable if behind a load balancer
-    trusted_proxies: []                # IPs of your load balancer(s)
+      - "127.0.0.1" # IPv4 localhost
+      - "::1" # IPv6 localhost
+      - "192.168.1.0/24" # Local network range
+      - "10.0.0.0/8" # Private network range
+      - "3.224.15.70" # IBM PA US-East egress IP
+      - "100.124.246.115" # macbook-pro-16 on Tailscale
+    trust_proxy: false # Enable if behind a load balancer
+    trusted_proxies: [] # IPs of your load balancer(s)
 
   command_policy:
-    enabled: false                     # Enable in production deployments
+    enabled: false # Enable in production deployments
     allowed_extensions:
       - ".ps1"
       - ".py"
       - ".bat"
       - ".cmd"
-    allowed_directories: []            # Configure script directories when enabled
+    allowed_directories: [] # Configure script directories when enabled
     # Example:
     # allowed_directories:
     #   - path: "C:\\Scripts\\TM1"

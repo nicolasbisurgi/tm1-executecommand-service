@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/Hubert-Heijkers/tm1-executecommand-service/command"
 	"gopkg.in/yaml.v3"
 )
 
@@ -261,60 +262,46 @@ func (c *Config) SaveToFile(filename string) error {
 	return nil
 }
 
-// IsCommandPermitted checks if a command is allowed based on directory-scoped policy.
-// Returns (allowed, reason) for logging purposes.
-func (c *Config) IsCommandPermitted(commandLine string) (bool, string) {
+// IsCommandPermitted checks if a parsed Command is allowed by the
+// directory-scoped policy. Returns (allowed, reason) for logging.
+func (c *Config) IsCommandPermitted(cmd command.Command) (bool, string) {
 	if !c.Security.CommandPolicy.Enabled {
 		return true, "command policy disabled"
 	}
 
-	// Check for shell metacharacters in the full command line
 	for _, meta := range shellMetacharacters {
-		if strings.Contains(commandLine, meta) {
+		if strings.Contains(cmd.Raw, meta) {
 			return false, fmt.Sprintf("command contains shell metacharacter: %q", meta)
 		}
 	}
 
-	// Find the script file in the command tokens
-	scriptPath, err := extractScriptPath(commandLine, c.Security.CommandPolicy.AllowedExtensions)
-	if err != nil {
-		return false, err.Error()
+	scriptPath := findScriptToken(cmd, c.Security.CommandPolicy.AllowedExtensions)
+	if scriptPath == "" {
+		return false, "no script file with allowed extension found in command"
 	}
 
-	// Verify file extension (redundant but explicit after extractScriptPath)
-	ext := strings.ToLower(filepath.Ext(scriptPath))
-	extAllowed := false
-	for _, allowedExt := range c.Security.CommandPolicy.AllowedExtensions {
-		if strings.EqualFold(ext, allowedExt) {
-			extAllowed = true
-			break
-		}
-	}
-	if !extAllowed {
-		return false, fmt.Sprintf("file extension %q is not allowed", ext)
-	}
-
-	// Resolve to clean absolute path
 	absPath, err := filepath.Abs(scriptPath)
 	if err != nil {
 		return false, fmt.Sprintf("failed to resolve script path: %v", err)
 	}
 	absPath = filepath.Clean(absPath)
 
-	// Try to resolve symlinks to prevent symlink-based bypasses
 	if resolved, err := filepath.EvalSymlinks(absPath); err == nil {
 		absPath = resolved
 	}
 
-	// Check the script is within an allowed directory
 	for _, dir := range c.Security.CommandPolicy.AllowedDirectories {
 		dirPath := filepath.Clean(dir.Path)
+		// Resolve symlinks on the allowed-dir side too so containment checks
+		// compare apples to apples (e.g. macOS resolves /var → /private/var).
+		if resolved, err := filepath.EvalSymlinks(dirPath); err == nil {
+			dirPath = resolved
+		}
 		if dir.IncludeSubdirs {
 			if isSubPath(absPath, dirPath) {
 				return true, "permitted"
 			}
 		} else {
-			// Script must be directly in this directory (not in a subdirectory)
 			if filepath.Dir(absPath) == dirPath {
 				return true, "permitted"
 			}
@@ -324,23 +311,27 @@ func (c *Config) IsCommandPermitted(commandLine string) (bool, string) {
 	return false, fmt.Sprintf("script %q is not in any allowed directory", absPath)
 }
 
-// extractScriptPath finds the script file path from a command line string.
-// It scans all tokens for the first one that has an allowed file extension.
-func extractScriptPath(commandLine string, allowedExtensions []string) (string, error) {
-	tokens := strings.Fields(commandLine)
+// findScriptToken returns the first token in cmd (Executable, then Args) whose
+// extension is in allowedExtensions. Preserves the legacy behavior that
+// `python C:\Scripts\foo.py` is permitted because `foo.py` is found.
+// Returns "" if no token matches.
+func findScriptToken(cmd command.Command, allowedExtensions []string) string {
+	candidates := make([]string, 0, 1+len(cmd.Args))
+	candidates = append(candidates, cmd.Executable)
+	candidates = append(candidates, cmd.Args...)
 
-	for _, token := range tokens {
-		// Remove surrounding quotes if present
-		token = strings.Trim(token, "\"'")
+	for _, token := range candidates {
 		ext := strings.ToLower(filepath.Ext(token))
+		if ext == "" {
+			continue
+		}
 		for _, allowedExt := range allowedExtensions {
 			if strings.EqualFold(ext, allowedExt) {
-				return token, nil
+				return token
 			}
 		}
 	}
-
-	return "", fmt.Errorf("no script file with allowed extension found in command")
+	return ""
 }
 
 // isSubPath checks if child path is under or equal to the parent directory.

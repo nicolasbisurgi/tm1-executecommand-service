@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/Hubert-Heijkers/tm1-executecommand-service/config"
+	"github.com/Hubert-Heijkers/tm1-executecommand-service/ip"
 	"github.com/Hubert-Heijkers/tm1-executecommand-service/logger"
 )
 
@@ -45,7 +46,7 @@ func setupTestServer(t *testing.T) (*Server, func()) {
 		t.Fatalf("Failed to initialize logger: %v", err)
 	}
 
-	srv := NewServer(cfg, log)
+	srv := NewServer(cfg, log, nil)
 
 	cleanup := func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -250,5 +251,179 @@ func TestServerRequestSizeLimit(t *testing.T) {
 
 	if resp.StatusCode != http.StatusOK {
 		t.Errorf("Expected status %d for acceptable request, got %d", http.StatusOK, resp.StatusCode)
+	}
+}
+
+// TestFullMiddlewareChain pins the composed chain
+//   RequestID → IPWhitelist → RateLimit → APIKeyAuth → SecurityHeaders → mux
+// Verifies short-circuit ordering, /health bypass semantics, X-Request-ID
+// propagation on every response, and that an authorized happy path reaches
+// the handler. Catches regressions when createServeMux is reordered.
+func TestFullMiddlewareChain(t *testing.T) {
+	const apiKey = "test-api-key-that-is-at-least-32-chars-long!!"
+
+	cfg := &config.Config{
+		Server: config.ServerConfig{HTTPPort: 8080, CommandTimeoutSeconds: 30},
+		Security: config.SecurityConfig{
+			HTTPS: config.HTTPSConfig{Enabled: false},
+			IPWhitelist: config.IPWhitelistConfig{
+				Enabled:    true,
+				AllowedIPs: []string{"127.0.0.1", "::1"},
+			},
+			Authentication: config.AuthConfig{
+				Enabled: true,
+				APIKey:  apiKey,
+			},
+			RateLimit: config.RateLimitConfig{
+				Enabled:           true,
+				RequestsPerMinute: 1000, // high enough not to interfere with main cases
+			},
+			CommandPolicy: config.CommandPolicyConfig{Enabled: false},
+		},
+	}
+
+	lg, err := logger.InitLogger(cfg)
+	if err != nil {
+		t.Fatalf("logger init: %v", err)
+	}
+	checker, err := ip.NewIPChecker(cfg.Security.IPWhitelist.AllowedIPs)
+	if err != nil {
+		t.Fatalf("ip checker: %v", err)
+	}
+
+	srv := NewServer(cfg, lg, checker)
+	srv.RegisterHandler("/ExecuteCommand", func(w http.ResponseWriter, r *http.Request) {
+		// Echo the resolved request ID so tests can assert end-to-end propagation.
+		fmt.Fprintf(w, "ok|%s", RequestIDFrom(r.Context()))
+	})
+	srv.RegisterHandler("/health", func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, "alive")
+	})
+
+	ts := httptest.NewServer(srv.createServeMux())
+	defer ts.Close()
+
+	get := func(t *testing.T, path string, headers map[string]string) (*http.Response, string) {
+		t.Helper()
+		req, err := http.NewRequest("GET", ts.URL+path, nil)
+		if err != nil {
+			t.Fatalf("new request: %v", err)
+		}
+		for k, v := range headers {
+			req.Header.Set(k, v)
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("do: %v", err)
+		}
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		return resp, string(body)
+	}
+
+	t.Run("X-Request-ID set on every response", func(t *testing.T) {
+		// Even on rejection, the outermost RequestID middleware must have run.
+		resp, _ := get(t, "/ExecuteCommand", nil) // no auth → 401
+		if resp.Header.Get("X-Request-ID") == "" {
+			t.Error("X-Request-ID missing on 401 response")
+		}
+	})
+
+	t.Run("Authorized happy path reaches handler", func(t *testing.T) {
+		resp, body := get(t, "/ExecuteCommand", map[string]string{
+			"Authorization": "Bearer " + apiKey,
+		})
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("status: got %d, want 200, body: %q", resp.StatusCode, body)
+		}
+		// Handler echoed `ok|<request-id>`. Confirm it matches the response header.
+		want := "ok|" + resp.Header.Get("X-Request-ID")
+		if body != want {
+			t.Errorf("body: got %q, want %q (request ID parity)", body, want)
+		}
+		// Security headers must be present on success.
+		if got := resp.Header.Get("X-Content-Type-Options"); got != "nosniff" {
+			t.Errorf("X-Content-Type-Options: got %q, want nosniff", got)
+		}
+	})
+
+	t.Run("APIKeyAuth rejects requests without Bearer token", func(t *testing.T) {
+		resp, _ := get(t, "/ExecuteCommand", nil)
+		if resp.StatusCode != http.StatusUnauthorized {
+			t.Errorf("status: got %d, want 401", resp.StatusCode)
+		}
+	})
+
+	t.Run("APIKeyAuth rejects wrong key", func(t *testing.T) {
+		resp, _ := get(t, "/ExecuteCommand", map[string]string{
+			"Authorization": "Bearer wrong-key-of-sufficient-length-blah-blah-blah",
+		})
+		if resp.StatusCode != http.StatusUnauthorized {
+			t.Errorf("status: got %d, want 401", resp.StatusCode)
+		}
+	})
+
+	t.Run("/health bypasses APIKeyAuth", func(t *testing.T) {
+		resp, body := get(t, "/health", nil)
+		if resp.StatusCode != http.StatusOK {
+			t.Errorf("status: got %d, want 200", resp.StatusCode)
+		}
+		if body != "alive" {
+			t.Errorf("body: got %q, want %q", body, "alive")
+		}
+	})
+}
+
+// TestFullMiddlewareChain_IPRejectionShortCircuits verifies IPWhitelist
+// short-circuits before APIKeyAuth — i.e. a request with a valid Bearer
+// token from a disallowed IP still gets 403, not 200, even on /health.
+//
+// Test client always connects from 127.0.0.1; we exclude that to provoke
+// the rejection path.
+func TestFullMiddlewareChain_IPRejectionShortCircuits(t *testing.T) {
+	const apiKey = "test-api-key-that-is-at-least-32-chars-long!!"
+
+	cfg := &config.Config{
+		Server: config.ServerConfig{HTTPPort: 8080, CommandTimeoutSeconds: 30},
+		Security: config.SecurityConfig{
+			IPWhitelist: config.IPWhitelistConfig{
+				Enabled:    true,
+				AllowedIPs: []string{"10.99.99.99"}, // intentionally not the test client
+			},
+			Authentication: config.AuthConfig{Enabled: true, APIKey: apiKey},
+		},
+	}
+
+	lg, _ := logger.InitLogger(cfg)
+	checker, _ := ip.NewIPChecker(cfg.Security.IPWhitelist.AllowedIPs)
+	srv := NewServer(cfg, lg, checker)
+	srv.RegisterHandler("/ExecuteCommand", func(w http.ResponseWriter, r *http.Request) {
+		t.Error("handler reached despite disallowed IP")
+	})
+	srv.RegisterHandler("/health", func(w http.ResponseWriter, r *http.Request) {
+		t.Error("health reached despite disallowed IP — IPWhitelist must NOT bypass")
+	})
+
+	ts := httptest.NewServer(srv.createServeMux())
+	defer ts.Close()
+
+	for _, path := range []string{"/ExecuteCommand", "/health"} {
+		t.Run(path, func(t *testing.T) {
+			req, _ := http.NewRequest("GET", ts.URL+path, nil)
+			req.Header.Set("Authorization", "Bearer "+apiKey)
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				t.Fatalf("do: %v", err)
+			}
+			defer resp.Body.Close()
+
+			if resp.StatusCode != http.StatusForbidden {
+				t.Errorf("status: got %d, want 403", resp.StatusCode)
+			}
+			// Even on rejection, X-Request-ID must be set (RequestID is outermost).
+			if resp.Header.Get("X-Request-ID") == "" {
+				t.Error("X-Request-ID missing on rejection response")
+			}
+		})
 	}
 }

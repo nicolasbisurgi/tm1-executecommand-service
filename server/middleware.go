@@ -2,13 +2,94 @@
 package server
 
 import (
+	"context"
 	"crypto/subtle"
 	"net"
 	"net/http"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/Hubert-Heijkers/tm1-executecommand-service/ip"
+	"github.com/Hubert-Heijkers/tm1-executecommand-service/logger"
+	"github.com/google/uuid"
 )
+
+// ctxKey is unexported so values written by these middlewares cannot be
+// overwritten by other packages putting strings into the context.
+type ctxKey int
+
+const requestIDKey ctxKey = iota
+
+// RequestID assigns a UUID to every incoming request, propagates it via
+// r.Context() so downstream layers can correlate logs, and echoes it on
+// the response as X-Request-ID for the caller. It is the OUTERMOST
+// middleware — every other layer's logs reference the value it sets.
+func RequestID(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		id := uuid.NewString()
+		w.Header().Set("X-Request-ID", id)
+		ctx := context.WithValue(r.Context(), requestIDKey, id)
+		next.ServeHTTP(w, r.WithContext(ctx))
+	})
+}
+
+// RequestIDFrom returns the request ID set by the RequestID middleware,
+// or "" if the middleware was not in the chain (e.g. a unit test calling
+// the handler directly).
+func RequestIDFrom(ctx context.Context) string {
+	id, _ := ctx.Value(requestIDKey).(string)
+	return id
+}
+
+// IPWhitelist rejects requests whose source IP is not in the configured
+// allowlist. When trustProxy is true and the request peer (RemoteAddr) is
+// in trustedProxies, the leftmost X-Forwarded-For entry is used as the
+// client identity — otherwise XFF is ignored to prevent spoofing.
+//
+// /health is NOT bypassed (per CONTEXT.md). Health probes from disallowed
+// IPs return 403; the self-warm goroutine connects from localhost which
+// callers are expected to allow.
+func IPWhitelist(checker *ip.IPChecker, trustProxy bool, trustedProxies []string, lg *logger.CommandLogger) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			clientIP := resolveClientIP(r, trustProxy, trustedProxies)
+			if !checker.IsAllowed(clientIP) {
+				lg.LogAccessDenied("ip_not_in_whitelist", logger.Fields{
+					"request_id":  RequestIDFrom(r.Context()),
+					"client_ip":   clientIP,
+					"remote_addr": r.RemoteAddr,
+					"method":      r.Method,
+					"path":        r.URL.Path,
+				})
+				http.Error(w, "Access denied", http.StatusForbidden)
+				return
+			}
+			next.ServeHTTP(w, r)
+		})
+	}
+}
+
+// resolveClientIP returns the request's client IP, consulting X-Forwarded-For
+// only when (a) trustProxy is enabled AND (b) the immediate peer is itself a
+// trusted proxy. Otherwise the TCP peer's address is used.
+func resolveClientIP(r *http.Request, trustProxy bool, trustedProxies []string) string {
+	peer := stripPort(r.RemoteAddr)
+	if !trustProxy {
+		return peer
+	}
+	for _, proxy := range trustedProxies {
+		if peer == proxy {
+			xff := r.Header.Get("X-Forwarded-For")
+			if xff == "" {
+				return peer
+			}
+			parts := strings.Split(xff, ",")
+			return strings.TrimSpace(parts[0])
+		}
+	}
+	return peer
+}
 
 // SecurityHeaders adds OWASP-recommended security headers to all responses.
 // HSTS is only included when httpsEnabled is true.

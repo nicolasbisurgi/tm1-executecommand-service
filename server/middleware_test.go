@@ -3,8 +3,25 @@ package server
 import (
 	"net/http"
 	"net/http/httptest"
+	"regexp"
 	"testing"
+
+	"github.com/Hubert-Heijkers/tm1-executecommand-service/config"
+	"github.com/Hubert-Heijkers/tm1-executecommand-service/ip"
+	"github.com/Hubert-Heijkers/tm1-executecommand-service/logger"
 )
+
+var uuidRegex = regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`)
+
+func newTestLogger(t *testing.T) *logger.CommandLogger {
+	t.Helper()
+	cfg := &config.Config{Logging: config.LoggingConfig{Enabled: false}}
+	lg, err := logger.InitLogger(cfg)
+	if err != nil {
+		t.Fatalf("logger init: %v", err)
+	}
+	return lg
+}
 
 func TestHTTPSRedirect(t *testing.T) {
 	tests := []struct {
@@ -360,5 +377,182 @@ func TestStripPort(t *testing.T) {
 				t.Errorf("stripPort(%q) = %q, want %q", tt.input, result, tt.expected)
 			}
 		})
+	}
+}
+
+func TestRequestID(t *testing.T) {
+	t.Run("Sets X-Request-ID header with valid UUID", func(t *testing.T) {
+		var captured string
+		handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			captured = RequestIDFrom(r.Context())
+			w.WriteHeader(http.StatusOK)
+		})
+
+		wrapped := RequestID(handler)
+		req := httptest.NewRequest("GET", "/test", nil)
+		rec := httptest.NewRecorder()
+
+		wrapped.ServeHTTP(rec, req)
+
+		header := rec.Header().Get("X-Request-ID")
+		if header == "" {
+			t.Fatal("X-Request-ID header not set")
+		}
+		if !uuidRegex.MatchString(header) {
+			t.Errorf("X-Request-ID = %q, want UUID v4 format", header)
+		}
+		if captured != header {
+			t.Errorf("ctx value = %q, header = %q (must match)", captured, header)
+		}
+	})
+
+	t.Run("Generates fresh ID per request", func(t *testing.T) {
+		seen := map[string]bool{}
+		handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {})
+		wrapped := RequestID(handler)
+
+		for i := 0; i < 5; i++ {
+			req := httptest.NewRequest("GET", "/test", nil)
+			rec := httptest.NewRecorder()
+			wrapped.ServeHTTP(rec, req)
+			id := rec.Header().Get("X-Request-ID")
+			if seen[id] {
+				t.Errorf("duplicate request ID across requests: %q", id)
+			}
+			seen[id] = true
+		}
+	})
+
+	t.Run("RequestIDFrom returns empty when middleware absent", func(t *testing.T) {
+		req := httptest.NewRequest("GET", "/test", nil)
+		if got := RequestIDFrom(req.Context()); got != "" {
+			t.Errorf("RequestIDFrom = %q, want empty string", got)
+		}
+	})
+}
+
+func TestIPWhitelist(t *testing.T) {
+	lg := newTestLogger(t)
+	pass := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("ok"))
+	})
+
+	tests := []struct {
+		name           string
+		allowedIPs     []string
+		trustProxy     bool
+		trustedProxies []string
+		remoteAddr     string
+		xff            string
+		path           string
+		expectedStatus int
+	}{
+		{
+			name:           "Allowed IP passes",
+			allowedIPs:     []string{"127.0.0.1"},
+			remoteAddr:     "127.0.0.1:54321",
+			expectedStatus: http.StatusOK,
+		},
+		{
+			name:           "Disallowed IP rejected with 403",
+			allowedIPs:     []string{"127.0.0.1"},
+			remoteAddr:     "10.0.0.99:54321",
+			expectedStatus: http.StatusForbidden,
+		},
+		{
+			name:           "XFF ignored when trust_proxy disabled",
+			allowedIPs:     []string{"127.0.0.1"},
+			trustProxy:     false,
+			remoteAddr:     "10.0.0.99:54321",
+			xff:            "127.0.0.1",
+			expectedStatus: http.StatusForbidden,
+		},
+		{
+			name:           "XFF honoured when peer is trusted proxy",
+			allowedIPs:     []string{"10.0.0.5", "192.168.1.1"},
+			trustProxy:     true,
+			trustedProxies: []string{"192.168.1.1"},
+			remoteAddr:     "192.168.1.1:54321",
+			xff:            "10.0.0.5",
+			expectedStatus: http.StatusOK,
+		},
+		{
+			name:           "Spoofed XFF from non-trusted peer rejected",
+			allowedIPs:     []string{"127.0.0.1"},
+			trustProxy:     true,
+			trustedProxies: []string{"192.168.1.1"},
+			remoteAddr:     "10.0.0.99:54321",
+			xff:            "127.0.0.1",
+			expectedStatus: http.StatusForbidden,
+		},
+		{
+			name:           "XFF client not in whitelist rejected",
+			allowedIPs:     []string{"192.168.1.1"},
+			trustProxy:     true,
+			trustedProxies: []string{"192.168.1.1"},
+			remoteAddr:     "192.168.1.1:54321",
+			xff:            "10.99.99.99",
+			expectedStatus: http.StatusForbidden,
+		},
+		{
+			name:           "/health from disallowed IP also returns 403 (no bypass)",
+			allowedIPs:     []string{"127.0.0.1"},
+			remoteAddr:     "10.0.0.99:54321",
+			path:           "/health",
+			expectedStatus: http.StatusForbidden,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			checker, err := ip.NewIPChecker(tt.allowedIPs)
+			if err != nil {
+				t.Fatalf("NewIPChecker: %v", err)
+			}
+
+			wrapped := IPWhitelist(checker, tt.trustProxy, tt.trustedProxies, lg)(pass)
+			path := tt.path
+			if path == "" {
+				path = "/test"
+			}
+			req := httptest.NewRequest("GET", path, nil)
+			req.RemoteAddr = tt.remoteAddr
+			if tt.xff != "" {
+				req.Header.Set("X-Forwarded-For", tt.xff)
+			}
+
+			rec := httptest.NewRecorder()
+			wrapped.ServeHTTP(rec, req)
+
+			if rec.Code != tt.expectedStatus {
+				t.Errorf("status: got %d, want %d, body: %q", rec.Code, tt.expectedStatus, rec.Body.String())
+			}
+		})
+	}
+}
+
+func TestIPWhitelistRejectionLogsRequestID(t *testing.T) {
+	lg := newTestLogger(t)
+	checker, err := ip.NewIPChecker([]string{"127.0.0.1"})
+	if err != nil {
+		t.Fatalf("NewIPChecker: %v", err)
+	}
+	pass := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {})
+
+	// Compose: RequestID (outer) -> IPWhitelist (inner).
+	// A rejection inside IPWhitelist must still see the request ID set by RequestID.
+	chain := RequestID(IPWhitelist(checker, false, nil, lg)(pass))
+
+	req := httptest.NewRequest("GET", "/test", nil)
+	req.RemoteAddr = "10.0.0.99:54321"
+	rec := httptest.NewRecorder()
+	chain.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusForbidden {
+		t.Errorf("status: got %d, want %d", rec.Code, http.StatusForbidden)
+	}
+	if id := rec.Header().Get("X-Request-ID"); !uuidRegex.MatchString(id) {
+		t.Errorf("X-Request-ID on rejection: got %q, want UUID", id)
 	}
 }

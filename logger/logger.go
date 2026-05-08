@@ -36,18 +36,15 @@ func (l *CommandLogger) Writer() io.Writer {
 // Fields represents structured log fields
 type Fields map[string]interface{}
 
-var instance *CommandLogger
-
 // InitLogger initializes the logging system based on configuration
 func InitLogger(cfg *config.Config) (*CommandLogger, error) {
     logger := &CommandLogger{
         logger: logrus.New(),
         threadCounter: 0,
     }
-    
+
     if cfg == nil || !cfg.Logging.Enabled {
         logger.logger.SetOutput(io.Discard)
-        instance = logger
         return logger, nil
     }
 
@@ -74,7 +71,6 @@ func InitLogger(cfg *config.Config) (*CommandLogger, error) {
 
     logger.logger.SetFormatter(formatter)
     logger.logger.SetOutput(rotator)
-    instance = logger
     return logger, nil
 }
 
@@ -113,19 +109,6 @@ func (f *CustomFormatter) Format(entry *logrus.Entry) ([]byte, error) {
     return []byte(logLine + "\n"), nil
 }
 
-// GetLogger returns the singleton logger instance
-func GetLogger() *CommandLogger {
-    if instance == nil {
-        logger := &CommandLogger{
-            logger: logrus.New(),
-            threadCounter: 0,
-        }
-        logger.logger.SetOutput(io.Discard)
-        instance = logger
-    }
-    return instance
-}
-
 // Info logs an info message (for backward compatibility)
 func (l *CommandLogger) Info(msg string) {
     threadID := l.getNextThreadID()
@@ -142,35 +125,38 @@ func (l *CommandLogger) LogHTTPRequest(r *http.Request, statusCode int, duration
     l.LogHTTPRequestProcessed(r, statusCode, duration, requestID, threadID)
 }
 
-// LogHTTPRequestReceived logs incoming HTTP requests
-func (l *CommandLogger) LogHTTPRequestReceived(r *http.Request, command string, allowed bool) (string, uint64) {
-    requestID := uuid.New().String()
+// LogHTTPRequestReceived logs an incoming HTTP request as soon as it reaches
+// the handler — before any validation or body parse. The requestID is
+// supplied by the caller (typically the RequestID middleware via context);
+// the command is intentionally NOT a parameter here because it isn't known
+// yet for POST requests. The command is later logged by LogCommandStart /
+// LogCommandError when it has actually been extracted and parsed.
+//
+// Returns the threadID generated here.
+func (l *CommandLogger) LogHTTPRequestReceived(r *http.Request, requestID string) uint64 {
     threadID := l.getNextThreadID()
-    
-    // Info level - basic request info with command
+
+    // Info level — basic request info, no command yet.
     l.logger.WithFields(logrus.Fields{
-        "request_id": requestID,
-        "thread_id": threadID,
-        "user_agent": r.UserAgent(),
-        "client_ip":  r.Header.Get("X-Forwarded-For"),
-        "allowed":    allowed,
-        "path":       r.URL.Path,
-        "method":     r.Method,
-        "command":    command,
+        "request_id":  requestID,
+        "thread_id":   threadID,
+        "user_agent":  r.UserAgent(),
+        "remote_addr": r.RemoteAddr,
+        "path":        r.URL.Path,
+        "method":      r.Method,
     }).Info("HTTP request received")
 
-    // Debug level - detailed request info and IP access info
+    // Debug level — detailed request info
     l.logger.WithFields(logrus.Fields{
-        "request_id": requestID,
-        "thread_id": threadID,
+        "request_id":      requestID,
+        "thread_id":       threadID,
         "request_url":     r.URL.String(),
         "headers":         r.Header,
         "x_forwarded_for": r.Header.Get("X-Forwarded-For"),
         "remote_addr":     r.RemoteAddr,
-        "allowed":         allowed,
-    }).Debug("IP access details")
+    }).Debug("HTTP request details")
 
-    return requestID, threadID
+    return threadID
 }
 
 // LogCommandStart logs when a command execution starts
@@ -322,12 +308,16 @@ func (l *CommandLogger) LogIPAccess(clientIP string, allowed bool, details map[s
     l.logger.WithFields(fields).Debug("IP access check")
 }
 
-// LogAccessDenied logs when access is denied for any reason
+// LogAccessDenied logs when access is denied. If the caller already populated
+// request_id / thread_id (e.g. from the RequestID middleware), those values
+// are preserved; otherwise fresh ones are generated.
 func (l *CommandLogger) LogAccessDenied(reason string, fields Fields) {
-    requestID := uuid.New().String()
-    threadID := l.getNextThreadID()
-    fields["request_id"] = requestID
-    fields["thread_id"] = threadID
+    if _, ok := fields["request_id"]; !ok {
+        fields["request_id"] = uuid.New().String()
+    }
+    if _, ok := fields["thread_id"]; !ok {
+        fields["thread_id"] = l.getNextThreadID()
+    }
     l.logger.WithFields(logrus.Fields(fields)).Warn("Access denied: " + reason)
 }
 

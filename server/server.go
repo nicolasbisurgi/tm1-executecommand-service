@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/Hubert-Heijkers/tm1-executecommand-service/config"
+	"github.com/Hubert-Heijkers/tm1-executecommand-service/ip"
 	"github.com/Hubert-Heijkers/tm1-executecommand-service/logger"
 )
 
@@ -21,14 +22,19 @@ type Server struct {
 	httpsServer *http.Server
 	config      *config.Config
 	logger      *logger.CommandLogger
+	ipChecker   *ip.IPChecker
 	handlers    map[string]http.HandlerFunc
 }
 
-func NewServer(cfg *config.Config, log *logger.CommandLogger) *Server {
+// NewServer constructs a Server. ipChecker may be nil when the IP whitelist
+// is disabled — createServeMux only wires the IPWhitelist middleware when
+// both the config flag is on AND the checker is non-nil.
+func NewServer(cfg *config.Config, log *logger.CommandLogger, ipChecker *ip.IPChecker) *Server {
 	return &Server{
-		config:   cfg,
-		logger:   log,
-		handlers: make(map[string]http.HandlerFunc),
+		config:    cfg,
+		logger:    log,
+		ipChecker: ipChecker,
+		handlers:  make(map[string]http.HandlerFunc),
 	}
 }
 
@@ -61,21 +67,33 @@ func (s *Server) createServeMux() http.Handler {
 		mux.HandleFunc(path, handler)
 	}
 
-	// Build middleware chain (innermost -> outermost)
+	// Build middleware chain (innermost -> outermost). Final order:
+	//   RequestID → IPWhitelist → RateLimit → APIKeyAuth → SecurityHeaders → mux
+	// RequestID is OUTERMOST so every other layer (including rejection logs
+	// from IPWhitelist / APIKeyAuth) can correlate with the X-Request-ID
+	// header sent back to the caller.
 	var h http.Handler = mux
 
-	// Security headers (innermost — closest to handlers)
 	h = SecurityHeaders(s.config.Security.HTTPS.Enabled, h)
 
-	// API key authentication
 	if s.config.Security.Authentication.Enabled {
 		h = APIKeyAuth(s.config.Security.Authentication.APIKey, h)
 	}
 
-	// Rate limiting (outermost — cheapest check first)
 	if s.config.Security.RateLimit.Enabled {
 		h = RateLimit(s.config.Security.RateLimit.RequestsPerMinute, h)
 	}
+
+	if s.config.Security.IPWhitelist.Enabled && s.ipChecker != nil {
+		h = IPWhitelist(
+			s.ipChecker,
+			s.config.Security.IPWhitelist.TrustProxy,
+			s.config.Security.IPWhitelist.TrustedProxies,
+			s.logger,
+		)(h)
+	}
+
+	h = RequestID(h)
 
 	return h
 }
