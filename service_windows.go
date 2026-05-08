@@ -60,15 +60,15 @@ func startService(app *App) {
 	}
 
 	if isWindowsService {
-		elog, err = eventlog.Open("ExecuteCommandService")
+		elog, err = eventlog.Open("TM1-ExecuteCommand-Service")
 		if err != nil {
 			return
 		}
 		defer elog.Close()
-		runWindowsService("ExecuteCommandService", app)
+		runWindowsService("TM1-ExecuteCommand-Service", app)
 	} else {
 		fmt.Printf("Starting ExecuteCommand service on port %d...\n", app.cfg.Server.HTTPPort)
-		elog = debug.New("ExecuteCommandService")
+		elog = debug.New("TM1-ExecuteCommand-Service")
 		app.runServer()
 	}
 }
