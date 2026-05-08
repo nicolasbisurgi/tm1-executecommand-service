@@ -1,67 +1,90 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
-	"os/exec"
+	"os"
+	"os/signal"
 	"strconv"
 	"strings"
+	"syscall"
+	"time"
 
-	"golang.org/x/sys/windows/svc"
-	"golang.org/x/sys/windows/svc/debug"
-	"golang.org/x/sys/windows/svc/eventlog"
+	"github.com/Hubert-Heijkers/tm1-executecommand-service/command"
+	"github.com/Hubert-Heijkers/tm1-executecommand-service/config"
+	"github.com/Hubert-Heijkers/tm1-executecommand-service/ip"
+	"github.com/Hubert-Heijkers/tm1-executecommand-service/logger"
+	"github.com/Hubert-Heijkers/tm1-executecommand-service/server"
+	"github.com/google/uuid"
 )
 
-func executeCommand(commandLine string, wait int64) (string, error) {
-	// Split the command-line into executable and arguments
-	cmdParts := strings.Fields(commandLine) // Split the string into command and arguments
+const maxRequestSize = 1024 * 1024 // 1MB max request size
 
-	// The first part should be the executable (or script path)
-	executable := cmdParts[0]
-	args := cmdParts[1:]
-
-	// Directly invoke the executable with arguments
-	cmd := exec.Command(executable, args...)
-
-	// If 'wait' is 1, run the command and wait for it to finish
-	if wait == 1 {
-		output, err := cmd.CombinedOutput() // Wait for command to finish and get output
-		return string(output), err
-	}
-
-	// 'wait' is 0, start the command and return immediately
-	if err := cmd.Start(); err != nil {
-		return "", err
-	}
-	// Return immediately without waiting for the command to finish
-	return "Command started successfully", nil
+// App holds the application dependencies, replacing package-level globals.
+type App struct {
+	cfg       *config.Config
+	ipChecker *ip.IPChecker
+	logger    *logger.CommandLogger
+	sync      command.SyncExecutor
+	async     command.AsyncExecutor
 }
 
 type executeCommandRequest struct {
-	CommandLine string `json:"CommandLine"` // Full command-line string including the path and parameters
-	Wait        int64  `json:"Wait"`        // Indicator for if the service should wait for the command to complete or not (1 vs 0 respectively)
+	CommandLine string `json:"CommandLine"`
+	Wait        int64  `json:"Wait"`
 }
 
-// commandHandler is the handler for the HTTP request
-func commandHandler(w http.ResponseWriter, r *http.Request) {
+type responseWriter struct {
+	http.ResponseWriter
+	statusCode int
+}
+
+func (rw *responseWriter) WriteHeader(code int) {
+	rw.statusCode = code
+	rw.ResponseWriter.WriteHeader(code)
+}
+
+func (app *App) commandHandler(w http.ResponseWriter, r *http.Request) {
+	start := time.Now()
+	lg := app.logger
+
+	rw := &responseWriter{
+		ResponseWriter: w,
+		statusCode:     http.StatusOK,
+	}
+
+	// Resolve request ID and emit "HTTP request received" before any
+	// validation or body parse so every rejection path inherits it for
+	// log correlation. The RequestID middleware normally supplies the
+	// value; the fallback handles unit tests that bypass the chain.
+	requestID := server.RequestIDFrom(r.Context())
+	if requestID == "" {
+		requestID = uuid.NewString()
+	}
+	threadID := lg.LogHTTPRequestReceived(r, requestID)
+
+	if r.ContentLength > maxRequestSize {
+		http.Error(rw, "Request too large", http.StatusBadRequest)
+		return
+	}
+
 	var commandLine string
 	var wait int64 = -1
 
-	// We accept calling this service as a function (GET) as well as an action (POST)
 	switch r.Method {
 	case http.MethodGet:
-		// Grab query parameters
-		q := r.URL.Query()
-
-		// Retrieve the 'commandLine' query parameter
-		commandLine = q.Get("CommandLine")
-
-		// Retrieve the 'wait' query parameter and convert it to boolean
-		waitParam := q.Get("Wait")
+		if len(r.URL.RawQuery) > maxRequestSize {
+			http.Error(rw, "Query string too large", http.StatusBadRequest)
+			return
+		}
+		commandLine = r.URL.Query().Get("CommandLine")
+		waitParam := r.URL.Query().Get("Wait")
 		if waitParam != "" {
 			parsedWait, err := strconv.ParseInt(waitParam, 10, 0)
 			if err == nil {
@@ -70,124 +93,235 @@ func commandHandler(w http.ResponseWriter, r *http.Request) {
 		}
 
 	case http.MethodPost:
-		// Read the request body
+		if r.Header.Get("Content-Type") != "application/json" {
+			http.Error(rw, "Content-Type must be application/json", http.StatusBadRequest)
+			return
+		}
+		r.Body = http.MaxBytesReader(rw, r.Body, maxRequestSize)
 		body, err := io.ReadAll(r.Body)
 		if err != nil {
-			http.Error(w, "Failed to read request body", http.StatusBadRequest)
+			if strings.Contains(err.Error(), "request body too large") {
+				http.Error(rw, "Request too large", http.StatusBadRequest)
+				return
+			}
+			http.Error(rw, "Failed to read request body", http.StatusBadRequest)
 			return
 		}
-
-		// Parse the JSON request into the CommandRequest struct
 		var cmdReq executeCommandRequest
 		if err := json.Unmarshal(body, &cmdReq); err != nil {
-			http.Error(w, "Invalid JSON format", http.StatusBadRequest)
+			http.Error(rw, "Invalid JSON format", http.StatusBadRequest)
 			return
 		}
-
-		// Use the command-line and wait parameter specified in the JSON payload
 		commandLine = cmdReq.CommandLine
 		wait = cmdReq.Wait
 
 	default:
-		http.Error(w, "Invalid request method", http.StatusMethodNotAllowed)
+		http.Error(rw, "Invalid request method", http.StatusMethodNotAllowed)
 		return
 	}
 
-	// Ensure the command line is provided
 	if commandLine == "" {
-		http.Error(w, "No or invalid CommandLine specified", http.StatusBadRequest)
+		http.Error(rw, "No or invalid CommandLine specified", http.StatusBadRequest)
 		return
 	}
 
-	// Ensure wait parameter is provided
+	const maxCommandLength = 10000
+	if len(commandLine) > maxCommandLength {
+		http.Error(rw, "CommandLine too large", http.StatusBadRequest)
+		return
+	}
+
 	if wait != 0 && wait != 1 {
-		http.Error(w, "No or invalid Wait value specified", http.StatusBadRequest)
+		http.Error(rw, "No or invalid Wait value specified", http.StatusBadRequest)
 		return
 	}
 
-	// Execute the ExecuteCommand
-	output, err := executeCommand(commandLine, wait)
+	parsedCmd, err := command.ParseCommand(commandLine)
 	if err != nil {
-		if output != "" {
-			http.Error(w, fmt.Sprintf("Error executing command: %v\nOutput: %s", err, output), http.StatusInternalServerError)
-		} else {
-			http.Error(w, fmt.Sprintf("Error executing command: %v", err), http.StatusInternalServerError)
-		}
+		lg.LogCommandError(fmt.Errorf("parse: %v", err), logger.Fields{
+			"command":    commandLine,
+			"source_ip":  r.RemoteAddr,
+			"request_id": requestID,
+			"thread_id":  threadID,
+		})
+		http.Error(rw, "Invalid command format", http.StatusBadRequest)
 		return
 	}
 
-	// Respond with the command output
+	if app.cfg != nil {
+		if permitted, reason := app.cfg.IsCommandPermitted(parsedCmd); !permitted {
+			lg.LogCommandError(&command.ErrPolicyRejected{Reason: reason}, logger.Fields{
+				"command":    commandLine,
+				"source_ip":  r.RemoteAddr,
+				"request_id": requestID,
+				"thread_id":  threadID,
+				"reason":     reason,
+			})
+			http.Error(rw, "Command not permitted", http.StatusForbidden)
+			return
+		}
+	}
+
+	lg.LogCommandStart(commandLine, logger.Fields{
+		"wait":       wait,
+		"source_ip":  r.RemoteAddr,
+		"request_id": requestID,
+		"thread_id":  threadID,
+		"user_agent": r.UserAgent(),
+		"method":     r.Method,
+		"path":       r.URL.Path,
+	})
+
+	if wait == 1 {
+		app.handleSync(rw, r, parsedCmd, commandLine, requestID, threadID, start)
+	} else {
+		app.handleAsync(rw, r, parsedCmd, commandLine, requestID, threadID, start)
+	}
+
+	lg.LogHTTPRequestProcessed(r, rw.statusCode, time.Since(start), requestID, threadID)
+}
+
+// handleSync runs the parsed command via the SyncExecutor and writes the
+// result. Per the locked decision, ErrNonZeroExit returns 200 with the
+// script's output so callers can see what the failing script printed.
+func (app *App) handleSync(rw *responseWriter, r *http.Request, cmd command.Command, raw, requestID string, threadID uint64, start time.Time) {
+	lg := app.logger
+	result, err := app.sync.Run(cmd)
+	body := result.Stdout + result.Stderr
+
+	fields := logger.Fields{
+		"command":     raw,
+		"source_ip":   r.RemoteAddr,
+		"request_id":  requestID,
+		"thread_id":   threadID,
+		"duration_ms": time.Since(start).Milliseconds(),
+		"wait":        int64(1),
+		"exit_code":   result.ExitCode,
+	}
+
+	if err == nil {
+		lg.LogCommandComplete(raw, body, time.Since(start), fields)
+		rw.Write([]byte(body))
+		return
+	}
+
+	var nonZero *command.ErrNonZeroExit
+	if errors.As(err, &nonZero) {
+		// Non-zero exit: surface the script's output to the caller.
+		fields["stderr_len"] = len(result.Stderr)
+		lg.LogCommandError(err, fields)
+		rw.Write([]byte(body))
+		return
+	}
+
+	// Timeout, spawn failure, anything else — generic 500.
+	lg.LogCommandError(err, fields)
+	http.Error(rw, "Command execution failed", http.StatusInternalServerError)
+}
+
+// handleAsync starts the parsed command via the AsyncExecutor and returns
+// immediately. The Handle's ID is logged for traceability (and reserved for
+// the future polling endpoint, see ROADMAP R1).
+func (app *App) handleAsync(rw *responseWriter, r *http.Request, cmd command.Command, raw, requestID string, threadID uint64, start time.Time) {
+	lg := app.logger
+	handle, err := app.async.Start(cmd)
+
+	fields := logger.Fields{
+		"command":     raw,
+		"source_ip":   r.RemoteAddr,
+		"request_id":  requestID,
+		"thread_id":   threadID,
+		"duration_ms": time.Since(start).Milliseconds(),
+		"wait":        int64(0),
+	}
+	if err != nil {
+		lg.LogCommandError(err, fields)
+		http.Error(rw, "Command execution failed", http.StatusInternalServerError)
+		return
+	}
+	fields["async_id"] = handle.ID
+	fields["pid"] = handle.PID
+	const startedMsg = "Command started successfully"
+	lg.LogCommandComplete(raw, startedMsg, time.Since(start), fields)
+	rw.Write([]byte(startedMsg))
+}
+
+func healthHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
-	w.Write([]byte(output))
+	w.Write([]byte(`{"status":"ok"}`))
 }
 
-var elog debug.Log
+func (app *App) runServer() {
+	srv := server.NewServer(app.cfg, app.logger, app.ipChecker)
+	srv.RegisterHandler("/ExecuteCommand", app.commandHandler)
+	srv.RegisterHandler("/health", healthHandler)
 
-type executeCommandService struct {
-	port string
-}
+	httpPort := strconv.Itoa(app.cfg.Server.HTTPPort)
+	httpsPort := ""
 
-func (m *executeCommandService) Execute(args []string, r <-chan svc.ChangeRequest, changes chan<- svc.Status) (svcSpecificEC bool, exitCode uint32) {
-	const cmdsAccepted = svc.AcceptStop | svc.AcceptShutdown
-	changes <- svc.Status{State: svc.StartPending}
-	go runServer(m.port)
-	changes <- svc.Status{State: svc.Running, Accepts: cmdsAccepted}
-loop:
-	for c := range r {
-		switch c.Cmd {
-		case svc.Interrogate:
-			changes <- c.CurrentStatus
-		case svc.Stop, svc.Shutdown:
-			break loop
-		default:
-			elog.Error(1, string(c.Cmd))
-		}
+	if app.cfg.Security.HTTPS.Enabled {
+		httpsPort = strconv.Itoa(app.cfg.Security.HTTPS.Port)
 	}
-	changes <- svc.Status{State: svc.StopPending}
-	return
-}
 
-func runWindowsService(name string, port string) {
-	run := svc.Run
-	elog.Info(1, "starting "+name+" service on port "+port)
-	err := run(name, &executeCommandService{port})
-	if err != nil {
-		elog.Error(1, "service "+name+" failed: "+err.Error())
-		return
+	if err := srv.Start(httpPort, httpsPort); err != nil {
+		log.Fatalf("Failed to start server: %v", err)
 	}
-	elog.Info(1, "service "+name+" stopped")
-}
 
-func runServer(port string) {
-	// Setup the HTTP server and route
-	http.HandleFunc("/ExecuteCommand", commandHandler)
+	stop := make(chan os.Signal, 1)
+	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
 
-	// Start listening to the user-defined or default port
-	http.ListenAndServe(":"+port, nil)
+	<-stop
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	if err := srv.Shutdown(ctx); err != nil {
+		log.Fatalf("Server shutdown error: %v", err)
+	}
 }
 
 func main() {
-	// Define a command-line flag for the port, with a default value of 8080
-	port := flag.String("port", "8080", "Port for the HTTP server to listen on")
-	flag.Parse() // Parse the command-line flags
+	configFile := flag.String("config", "", "Path to configuration file (required)")
+	flag.Parse()
 
-	// Determine if the service is begin started as a Windows service
-	isWindowsService, err := svc.IsWindowsService()
+	if *configFile == "" {
+		log.Fatal("Configuration file is required. Use --config flag to specify the path.")
+	}
+
+	cfg, err := config.LoadConfig(*configFile)
 	if err != nil {
-		log.Fatalf("Failed to determine if we are running in a windows service: %v", err)
+		log.Fatalf("Failed to load configuration: %v", err)
 	}
 
-	// Start the ExecuteCommand service
-	if isWindowsService {
-		elog, err = eventlog.Open("TM1-ExecuteCommand-Service")
-		if err != nil {
-			return
-		}
-		defer elog.Close()
-		runWindowsService("TM1-ExecuteCommand-Service", *port)
-	} else {
-		fmt.Printf("Starting ExecuteCommand service on port %s...\n", *port)
-		elog = debug.New("TM1-ExecuteCommand-Service")
-		runServer(*port)
+	lg, err := logger.InitLogger(cfg)
+	if err != nil {
+		log.Fatalf("Failed to initialize logger: %v", err)
 	}
+
+	var ipChecker *ip.IPChecker
+	if cfg.Security.IPWhitelist.Enabled {
+		ipChecker, err = ip.NewIPChecker(cfg.Security.IPWhitelist.AllowedIPs)
+		if err != nil {
+			log.Fatalf("Failed to initialize IP checker: %v", err)
+		}
+		lg.Info("IP whitelist enabled with " +
+			strconv.Itoa(len(cfg.Security.IPWhitelist.AllowedIPs)) +
+			" entries")
+	}
+
+	syncExec := command.NewSyncExecutor(time.Duration(cfg.Server.CommandTimeoutSeconds) * time.Second)
+	asyncExec := command.NewAsyncExecutor()
+
+	app := &App{
+		cfg:       cfg,
+		ipChecker: ipChecker,
+		logger:    lg,
+		sync:      syncExec,
+		async:     asyncExec,
+	}
+
+	lg.Info("Service starting with configuration from: " + *configFile)
+
+	startService(app)
 }

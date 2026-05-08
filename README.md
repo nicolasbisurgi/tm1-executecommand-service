@@ -58,6 +58,81 @@ Either of these requests will start `/bin/bash /path/to/script.sh arg1 arg2` and
 
 > Note that while TM1's `ExecuteCommand` function didn't return anything, if the requester is willing to wait for the command to complete, the output is returned in the response body, ready to be consumed if needed.
 
+### Configuration
+
+The service is configured using a `config.yaml` file, which includes the following sections:
+
+- **Server Configuration**:
+  - `http_port`: The port on which the server listens for HTTP requests. Default is 8080.
+  - `command_timeout_seconds`: The maximum time allowed for a command to execute before timing out. Default is 300 seconds.
+
+- **Logging Configuration**:
+  - `enabled`: Indicates whether logging is enabled.
+  - `file`: The path to the log file.
+  - `level`: The logging level (e.g., info, debug).
+  - `max_size`: The maximum size of the log file before it is rotated.
+  - `max_backups`: The maximum number of backup log files to keep.
+  - `max_age`: The maximum age (in days) to retain old log files.
+
+- **Security Configuration** (`security:`):
+  - **Authentication** (`authentication:`):
+    - `enabled`: When `true`, every request to `/ExecuteCommand` must carry an `Authorization: Bearer <api_key>` header. The `/health` endpoint bypasses this check so external probes can liveness-check without a key.
+    - `api_key`: A shared secret. Must be at least 32 characters when authentication is enabled. Compared in constant time to prevent timing attacks.
+  - **IP Whitelist** (`ip_whitelist:`):
+    - `enabled`: When `true`, only requests originating from one of the configured IPs are accepted. **`/health` does NOT bypass this check** — when the whitelist is enabled, you must include `127.0.0.1` (and `::1` if probing over IPv6) in `allowed_ips` so the service's own self-warm goroutine can reach the health endpoint.
+    - `allowed_ips`: List of allowed IPs and CIDR ranges (e.g. `127.0.0.1`, `192.168.1.0/24`, `10.0.0.0/8`, IBM Planning Analytics SaaS egress IPs).
+    - `trust_proxy`: When `false` (default), the source IP is `r.RemoteAddr` regardless of any `X-Forwarded-For` header. When `true`, the leftmost `X-Forwarded-For` entry is used **only** if the immediate TCP peer (`RemoteAddr`) is in `trusted_proxies`. This prevents `X-Forwarded-For` spoofing from arbitrary clients.
+    - `trusted_proxies`: List of proxy IPs that are allowed to set `X-Forwarded-For`. Consulted only when `trust_proxy: true`.
+  - **Command Policy** (`command_policy:`):
+    - `enabled`: When `true`, only commands invoking scripts under one of the allowed directories with one of the allowed extensions are executed. Disabled by default for development; **enable in production**.
+    - `allowed_extensions`: List of script file extensions (with leading dot), e.g. `.ps1`, `.py`, `.bat`, `.cmd`. The policy looks across all command tokens for one matching this list.
+    - `allowed_directories`: List of directory roots from which scripts can be executed. Each entry has:
+      - `path`: Absolute or relative directory path. Resolved to absolute and symlink-resolved at request time.
+      - `include_subdirs`: When `true`, scripts in subdirectories of `path` are also permitted; when `false`, scripts must live directly in `path`.
+    - The policy also rejects commands containing shell metacharacters (`& | ; ` `` ` `` ` > < $ \n \r`) on the raw input as defence-in-depth against injection through arguments.
+  - **Rate Limit** (`rate_limit:`):
+    - `enabled`: When `true`, per-IP rate limiting is enforced.
+    - `requests_per_minute`: Maximum requests allowed per source IP within a one-minute sliding window. Excess requests get 429 Too Many Requests.
+  - **HTTPS Configuration** (`https:`):
+    - `enabled`: Indicates whether HTTPS is enabled. When enabled, the HTTP listener (if running) automatically redirects to HTTPS with a permanent redirect.
+    - `port`: The port on which the server listens for HTTPS requests. Default is 9443.
+    - `cert_file`: The path to the SSL certificate file.
+    - `key_file`: The path to the SSL key file.
+
+### Security Model & Operating Notes
+
+The service is designed for the **TM1 v12 (SaaS) → customer-server** deployment model: IBM Planning Analytics issues `ExecuteHttpRequest` calls from a known, published egress IP range; the customer runs this service on their own server (typically alongside ODBCIS) under a least-privilege Windows service account.
+
+#### Middleware chain
+
+Every accepted request flows through (outer → inner):
+
+```
+RequestID  →  IPWhitelist  →  RateLimit  →  APIKeyAuth  →  SecurityHeaders  →  /ExecuteCommand
+```
+
+Disallowed IPs short-circuit before consuming a rate-limit slot or being authenticated. Authentication runs after rate limiting so unauthenticated noise does not bypass the per-IP cap. The `/health` endpoint bypasses `APIKeyAuth` only — it does NOT bypass `IPWhitelist` or `RateLimit`.
+
+#### Request traceability with `X-Request-ID`
+
+The outermost `RequestID` middleware assigns every incoming request a fresh UUID and:
+- echoes it back as the `X-Request-ID` response header on every response, including 4xx/5xx rejections;
+- propagates it via `r.Context()` so all downstream layers (middlewares + handler) emit logs carrying the same `request_id` field.
+
+When a customer reports "request `abc-123` was rejected, why?", grepping logs for `request_id=abc-123` surfaces every log line for that request — including the rejection reason from `IPWhitelist`, `APIKeyAuth`, `RateLimit`, the parser, the policy check, or the executor. This is the canonical mechanism for diagnosing rejections without leaking internal details to the caller.
+
+#### Wire-format note: non-zero exit codes
+
+When `Wait=1` and the executed script exits with a **non-zero status**, the service returns **HTTP 200** with the script's combined stdout+stderr in the response body. The `exit_code` is captured in logs (typed as `ErrNonZeroExit`) but not surfaced to the caller. This is intentional — TM1 callers can read what their failing script printed, while internal error details (timeouts, spawn failures, etc.) still return generic 500 with no body leak.
+
+> **Behavioural change vs. earlier versions**: Prior to the security-hardening pass, non-zero exit returned HTTP 500 with the body discarded. Callers that previously branched on the 500 status to detect script failure should now branch on the script's own output or a separate side-channel.
+
+#### Logging notes for ops
+
+- The `HTTP request received` info line is now emitted at the **top** of the handler, before any validation. Every accepted request produces this line, even if it later 400s on bad content-type or oversize body.
+- The `allowed=true|false` field on `HTTP request received` has been **removed**. IP-allowlist rejections now produce a separate `Access denied: ip_not_in_whitelist` log entry from the `IPWhitelist` middleware, carrying the same `request_id`.
+- Async (`Wait=0`) executions now log an `async_id` (UUID) and `pid` on the completion line. The async ID is reserved for a future polling endpoint (see `docs/ROADMAP.md#R1`); today it is informational only.
+
 ### How to use
 
 Run the Go application directly from source, optionally specifying a port using the --port flag, as in:

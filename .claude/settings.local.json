@@ -1,0 +1,25 @@
+{
+  "permissions": {
+    "allow": [
+      "WebFetch(domain:www.ibm.com)",
+      "Bash(go mod tidy:*)",
+      "Bash(GOOS=windows GOARCH=amd64 go build:*)",
+      "Bash(GOOS=windows go vet:*)",
+      "Bash(git add:*)",
+      "Bash(git commit:*)",
+      "Bash(git push:*)",
+      "mcp__plugin_context-mode_context-mode__ctx_batch_execute",
+      "mcp__plugin_context-mode_context-mode__ctx_search",
+      "mcp__plugin_context-mode_context-mode__ctx_execute_file",
+      "Bash(go test *)",
+      "Bash(git stash *)",
+      "Bash(go build *)",
+      "Bash(go vet *)",
+      "Read(//tmp/**)",
+      "Bash(chmod +x /Users/nicolasbisurgi/Work/Projects/Products/tm1-executecommand-service/scripts/manual-test/test-from-mac.sh)",
+      "Bash(bash -n /Users/nicolasbisurgi/Work/Projects/Products/tm1-executecommand-service/scripts/manual-test/test-from-mac.sh)",
+      "Bash(bash -n scripts/manual-test/test-from-mac.sh)",
+      "Bash(./scripts/manual-test/test-from-mac.sh --help)"
+    ]
+  }
+}
