@@ -1,0 +1,2 @@
+This file has the wrong extension on purpose.
+The command policy should reject `C:\Scripts\TM1\fake.txt` because .txt is not in allowed_extensions.

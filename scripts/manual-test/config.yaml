@@ -1,0 +1,68 @@
+## Test deployment config for Mac → Windows over Tailscale.
+##
+## Deploy alongside tm1-executecommand-service.exe on the Windows host.
+## Layout assumed:
+##   C:\TM1ExecCmd\
+##     ├── tm1-executecommand-service.exe
+##     ├── config.yaml          (this file)
+##     ├── logs\                (created automatically)
+##     └── ... (cert\ if HTTPS)
+##   C:\Scripts\TM1\            (allowed scripts; deploy contents of test-scripts\ here)
+##     ├── echo.bat
+##     ├── exit-7.bat
+##     ├── long-running.bat
+##     ├── fake.txt             (wrong-extension test)
+##     └── sub\
+##         └── nested.bat
+##   C:\Scripts\Outside\        (NOT allowed; deploy test-scripts-outside\)
+##     └── blocked.bat
+##
+## Run from `C:\TM1ExecCmd\` as `tm1-executecommand-service.exe --config=config.yaml`
+## The test runner test-from-mac.sh expects the API key below.
+
+server:
+  http_port: 9092
+  command_timeout_seconds: 5     # short — long-running.bat triggers ErrTimeout
+
+logging:
+  enabled: true
+  file: "logs/tm1executecommandservice.log"
+  level: "debug"                 # verbose for testing; switch to info in prod
+  max_size: 10
+  max_backups: 3
+  max_age: 7
+
+security:
+  authentication:
+    enabled: true
+    api_key: "test-api-key-that-is-at-least-32-chars-long!!"
+
+  ip_whitelist:
+    enabled: true
+    allowed_ips:
+      - "127.0.0.1"              # self-warm /health probe
+      - "::1"
+      - "100.64.0.0/10"          # Tailscale CGNAT range — covers any device on your tailnet
+    trust_proxy: false
+    trusted_proxies: []
+
+  command_policy:
+    enabled: true
+    allowed_extensions:
+      - ".bat"
+      - ".cmd"
+      - ".ps1"
+      - ".py"
+    allowed_directories:
+      - path: "C:\\Scripts\\TM1"
+        include_subdirs: true
+
+  rate_limit:
+    enabled: false               # Off by default; enable manually to test 429.
+    requests_per_minute: 60
+
+  https:
+    enabled: false               # HTTP only for this test setup.
+    port: 9443
+    cert_file: "cert/server.crt"
+    key_file: "cert/server.key"
